@@ -1,20 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { runTool } from "../src/runtime.js";
-import {
-  compileMatcher,
-  decodeCursor,
-  encodeCursor,
-  LogSearcher,
-  readLines,
-  type BuildLogResponse,
-  type SearchLogResponse,
-} from "../src/tools/logs.js";
+import { decodeCursor, encodeCursor, type BuildLogResponse } from "../src/tools/logs.js";
+import { readLines, repeatKey, stripAnsi } from "../src/tools/logText.js";
 import { json, logLines, mockJenkins, parse, session, streamedLog } from "./helpers.js";
 
 const BUILD = "GET /job/app/lastBuild/api/json";
 const LOG = "GET /job/app/7/logText/progressiveText";
+const ESC = "\u001b";
 
-function logJenkins(text: string | string[], opts: { more?: boolean; onPull?: () => void } = {}) {
+export function logJenkins(
+  text: string | string[],
+  opts: { more?: boolean; onPull?: () => void } = {},
+) {
   const chunks = Array.isArray(text) ? text : [text];
   const size = chunks.join("").length;
   return mockJenkins({
@@ -35,16 +32,12 @@ function logJenkins(text: string | string[], opts: { more?: boolean; onPull?: ()
 async function getLog(
   jenkins: ReturnType<typeof mockJenkins>,
   args: Record<string, unknown>,
-  maxResultChars?: number,
+  overrides: Parameters<typeof session>[1] = {},
 ) {
-  const out = await runTool(
-    session(jenkins.fetch, maxResultChars ? { maxResultChars } : {}),
-    "getBuildLog",
-    {
-      jobFullName: "app",
-      ...args,
-    },
-  );
+  const out = await runTool(session(jenkins.fetch, overrides), "getBuildLog", {
+    jobFullName: "app",
+    ...args,
+  });
   const body = parse(out.text);
   return { out, body, result: body.result as BuildLogResponse };
 }
@@ -141,21 +134,6 @@ describe("getBuildLog paging", () => {
     expect(parse(out.text).message).toMatch(/issued for build #6/);
   });
 
-  it("shortens a page to the size cap and says how to continue", async () => {
-    const big = Array.from({ length: 50 }, (_, i) => `${i}:${"x".repeat(200)}`).join("\n");
-    const { body, result } = await getLog(logJenkins(big), { skip: 0, limit: 50 }, 3000);
-    expect(result.lines.length).toBeLessThan(50);
-    expect(result.hasMoreContent).toBe(true);
-    expect(result.nextCursor).toBeTruthy();
-    expect(body.message).toMatch(/Page shortened.*nextCursor/);
-  });
-
-  it("clips very long lines", async () => {
-    const { result } = await getLog(logJenkins(`${"y".repeat(10_000)}\n`), {});
-    expect(result.lines[0]!.length).toBeLessThan(4_100);
-    expect(result.lines[0]).toMatch(/line clipped, 10000 chars/);
-  });
-
   it("returns the empty result for a job without builds", async () => {
     const { body } = await getLog(mockJenkins({}), {});
     expect(body.result).toBeUndefined();
@@ -173,103 +151,174 @@ describe("getBuildLog paging", () => {
   });
 });
 
-describe("log search", () => {
-  const lines = [
-    "start",
-    "compile ok",
-    "ERROR one",
-    "after one",
-    "x",
-    "error two",
-    "after two",
-    "end",
-  ];
+describe("getBuildLog size cap", () => {
+  const wide = (n: number, width: number) =>
+    Array.from({ length: n }, (_, i) => `${i}:${"x".repeat(width)}`).join("\n");
 
-  function search(maxMatches: number, contextLines: number, ignoreCase = false) {
-    const s = new LogSearcher(compileMatcher("ERROR", false, ignoreCase), maxMatches, contextLines);
-    for (const l of lines) if (!s.push(l)) break;
-    return s;
-  }
-
-  it("matches plain text case-sensitively by default", () => {
-    const s = search(10, 0);
-    expect(s.matches.map((m) => m.matchedLineNumber)).toEqual([3]);
+  it.each([
+    ["forward", { skip: 0, limit: 2200 }],
+    ["tail", { limit: -2200 }],
+    ["default tail", {}],
+  ])("keeps the whole %s result under maxResultChars as valid JSON", async (_name, args) => {
+    for (const max of [1_000, 3_000, 40_000]) {
+      const { out, body, result } = await getLog(logJenkins(wide(2500, 120)), args, {
+        maxResultChars: max,
+      });
+      expect(out.text.length).toBeLessThanOrEqual(max);
+      expect(body.truncatedResult).toBeUndefined();
+      expect(result.lines.length).toBeGreaterThan(0);
+    }
   });
 
-  it("returns context before, the match, and context after", () => {
-    const s = search(10, 1, true);
-    expect(s.matches[0]).toEqual({
-      matchedLineNumber: 3,
-      matchedLine: "ERROR one",
-      contextLines: ["compile ok", "ERROR one", "after one"],
-      contextStartLine: 2,
-      contextEndLine: 4,
-    });
-    expect(s.matches[1]!.contextLines).toEqual(["x", "error two", "after two"]);
+  it("says how to continue a forward page it shortened", async () => {
+    const { body, result } = await getLog(
+      logJenkins(wide(50, 200)),
+      { skip: 0, limit: 50 },
+      {
+        maxResultChars: 3_000,
+      },
+    );
+    expect(result.lines.length).toBeLessThan(50);
+    expect(result.hasMoreContent).toBe(true);
+    const next = decodeCursor(result.nextCursor!, 7);
+    expect(next.skipLines).toBe(result.lines.length);
+    expect(body.message).toMatch(/Page shortened.*nextCursor/);
   });
 
-  it("stops early once the budget is full and one more match is seen", () => {
-    const s = search(1, 0, true);
-    expect(s.matches).toHaveLength(1);
-    expect(s.hasMoreMatches).toBe(true);
-    expect(s.lineNumber).toBe(6);
+  it("cuts a single line bigger than the cap and marks it", async () => {
+    const { out, result } = await getLog(
+      logJenkins(`${"y".repeat(5_000)}\n`),
+      {},
+      {
+        maxResultChars: 1_000,
+      },
+    );
+    expect(out.text.length).toBeLessThanOrEqual(1_000);
+    expect(result.lines[0]).toMatch(/…\[line truncated\]$/);
   });
 
-  it("supports regex and inline (?i)", () => {
-    expect(compileMatcher("err(or)? \\w+", true, true)("ERROR two")).toBe(true);
-    expect(compileMatcher("(?i)error", true, false)("ERROR")).toBe(true);
-    expect(compileMatcher("^end$", true, false)("the end")).toBe(false);
+  it("clips very long lines even under a large cap", async () => {
+    const { result } = await getLog(logJenkins(`${"y".repeat(10_000)}\n`), {});
+    expect(result.lines[0]!.length).toBeLessThan(4_100);
+    expect(result.lines[0]).toMatch(/…\[line truncated\]$/);
   });
 
-  it("rejects catastrophic and invalid regexes", () => {
-    expect(() => compileMatcher("(a+)+$", true, false)).toThrow(/too expensive/);
-    expect(() => compileMatcher("(unclosed", true, false)).toThrow(/Invalid regular expression/);
+  it("counts JSON escaping, so colour-heavy lines kept with keepAnsi still fit", async () => {
+    const line = `${ESC}[35m${"z".repeat(30)}${ESC}[0m`.repeat(20);
+    const text = Array.from({ length: 400 }, () => line).join("\n");
+    const { out, body } = await getLog(
+      logJenkins(text),
+      { keepAnsi: true, limit: -400 },
+      {
+        maxResultChars: 5_000,
+      },
+    );
+    expect(out.text.length).toBeLessThanOrEqual(5_000);
+    expect(body.truncatedResult).toBeUndefined();
+  });
+});
+
+describe("ANSI stripping", () => {
+  it("removes CSI, OSC and two-byte escapes", () => {
+    expect(stripAnsi(`${ESC}[35mpink${ESC}[0m ${ESC}[32;1mbold${ESC}[0m`)).toBe("pink bold");
+    expect(stripAnsi(`${ESC}]8;;https://x.test\u0007link${ESC}]8;;\u0007`)).toBe("link");
+    expect(stripAnsi(`${ESC}Mup`)).toBe("up");
+    expect(stripAnsi("plain [35m text")).toBe("plain [35m text");
   });
 
-  it("runs end to end through the tool with the plugin's result shape", async () => {
+  it("strips by default and keeps codes with keepAnsi", async () => {
+    const text = `${ESC}[31mFAILED${ESC}[0m test\n`;
+    const plain = await getLog(logJenkins(text), {});
+    expect(plain.result.lines).toEqual(["FAILED test"]);
+    const kept = await getLog(logJenkins(text), { keepAnsi: true });
+    expect(kept.result.lines).toEqual([`${ESC}[31mFAILED${ESC}[0m test`]);
+  });
+});
+
+describe("excludePattern", () => {
+  it("drops matching lines before paging and reports how many", async () => {
+    const text = ["a", "noise 1", "b", "noise 2", "c"].join("\n");
+    const { body, result } = await getLog(logJenkins(text), { excludePattern: "^noise" });
+    expect(result.lines).toEqual(["a", "b", "c"]);
+    expect(result).toMatchObject({ startLine: 1, endLine: 5, totalLines: 5 });
+    expect(body.message).toMatch(/Dropped 2 line\(s\) matching excludePattern/);
+  });
+
+  it("matches the ANSI-stripped text", async () => {
+    const text = [`${ESC}[2mnoise${ESC}[0m`, "keep"].join("\n");
+    const { result } = await getLog(logJenkins(text), { excludePattern: "^noise$" });
+    expect(result.lines).toEqual(["keep"]);
+  });
+
+  it("rejects long and catastrophic patterns", async () => {
+    const tooLong = await getLog(logJenkins("x"), { excludePattern: "a".repeat(1001) });
+    expect(parse(tooLong.out.text).message).toMatch(/excludePattern is too long/);
+    const slow = await getLog(logJenkins("x"), { excludePattern: "(a+)+$" });
+    expect(parse(slow.out.text).message).toMatch(/excludePattern is too expensive/);
+  });
+
+  it("keeps cursors exact across dropped lines", async () => {
+    const lines = Array.from({ length: 20 }, (_, i) => (i % 2 ? `noise ${i}` : `keep ${i}`));
     const jenkins = logJenkins(lines.join("\n"));
-    const out = await runTool(session(jenkins.fetch), "searchBuildLog", {
-      jobFullName: "app",
-      pattern: "error",
-      ignoreCase: true,
-      maxMatches: 1,
+    const first = await getLog(jenkins, { skip: 0, limit: 3, excludePattern: "^noise" });
+    expect(first.result.lines).toEqual(["keep 0", "keep 2", "keep 4"]);
+    const second = await getLog(jenkins, {
+      cursor: first.result.nextCursor,
+      limit: 3,
+      excludePattern: "^noise",
     });
-    const result = parse(out.text).result as SearchLogResponse;
-    expect(result).toEqual({
-      pattern: "error",
-      useRegex: false,
-      ignoreCase: true,
-      matchCount: 1,
-      hasMoreMatches: true,
-      totalLines: 6,
-      matches: [
-        {
-          matchedLineNumber: 3,
-          matchedLine: "ERROR one",
-          contextLines: ["ERROR one"],
-          contextStartLine: 3,
-          contextEndLine: 3,
-        },
-      ],
-    });
+    expect(second.result.lines).toEqual(["keep 6", "keep 8", "keep 10"]);
+  });
+});
+
+describe("collapseRepeats", () => {
+  it("ignores leading timestamps when comparing lines", () => {
+    expect(repeatKey("[16:48:09]: waiting for simulator")).toBe("waiting for simulator");
+    expect(repeatKey("2026-01-02T03:04:05.123Z waiting")).toBe("waiting");
+    expect(repeatKey("[2026-01-02 03:04:05] waiting")).toBe("waiting");
+    expect(repeatKey("10:20:30.120 waiting")).toBe("waiting");
+    expect(repeatKey("build 10:20")).toBe("build 10:20");
   });
 
-  it("validates pattern input like the plugin", async () => {
-    const jenkins = logJenkins("x\n");
-    const empty = await runTool(session(jenkins.fetch), "searchBuildLog", {
-      jobFullName: "app",
-      pattern: "",
-    });
-    expect(parse(empty.text).message).toBe("Search pattern cannot be null or empty");
-    const long = await runTool(session(jenkins.fetch), "searchBuildLog", {
-      jobFullName: "app",
-      pattern: "a".repeat(1001),
-      useRegex: true,
-    });
-    expect(parse(long.text).message).toMatch(/too long: 1001 characters, the maximum is 1000/);
+  it("folds identical neighbouring lines with their line range", async () => {
+    const text = [
+      "start",
+      ...Array.from({ length: 5 }, (_, i) => `[16:48:0${i}]: waiting for simulator`),
+      "done",
+    ].join("\n");
+    const { body, result } = await getLog(logJenkins(text), { collapseRepeats: true });
+    expect(result.lines).toEqual([
+      "start",
+      "[16:48:00]: waiting for simulator … repeated 5× (lines 2–6)",
+      "done",
+    ]);
+    expect(result).toMatchObject({ startLine: 1, endLine: 7, totalLines: 7 });
+    expect(body.message).toMatch(/Folded 4 repeated line/);
   });
 
-  it("redacts secrets that appear in log lines", async () => {
+  it("is off by default in MCP mode and on when the profile says so", async () => {
+    const text = ["x", "x", "x"].join("\n");
+    expect((await getLog(logJenkins(text), {})).result.lines).toEqual(["x", "x", "x"]);
+    const folded = await getLog(logJenkins(text), {}, { collapseRepeats: true });
+    expect(folded.result.lines).toEqual(["x … repeated 3× (lines 1–3)"]);
+  });
+
+  it("pages over folded runs without losing or repeating lines", async () => {
+    const text = ["a", "r", "r", "r", "b", "c"].join("\n");
+    const jenkins = logJenkins(text);
+    const first = await getLog(jenkins, { skip: 0, limit: 2, collapseRepeats: true });
+    expect(first.result.lines).toEqual(["a", "r … repeated 3× (lines 2–4)"]);
+    const second = await getLog(jenkins, {
+      cursor: first.result.nextCursor,
+      limit: 2,
+      collapseRepeats: true,
+    });
+    expect(second.result.lines).toEqual(["b", "c"]);
+  });
+});
+
+describe("getBuildLog redaction", () => {
+  it("redacts secrets in log lines and counts them", async () => {
     const jenkins = mockJenkins({
       [BUILD]: json({ number: 7 }),
       [LOG]: () => streamedLog(["export AWS_SECRET_ACCESS_KEY=abc123\n", "password=hunter2\n"]),
@@ -277,6 +326,6 @@ describe("log search", () => {
     const out = await runTool(session(jenkins.fetch), "getBuildLog", { jobFullName: "app" });
     expect(out.text).not.toContain("hunter2");
     expect(out.text).not.toContain("abc123");
-    expect(out.text).toContain("[REDACTED]");
+    expect(parse(out.text).message).toMatch(/^Data retrieved successfully \(2 values redacted\)\./);
   });
 });

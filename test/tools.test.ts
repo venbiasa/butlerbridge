@@ -325,14 +325,18 @@ describe("test results", () => {
     expect(body.status).toBe("COMPLETED");
   });
 
-  it("says the plugin is missing when the report endpoint is gone", async () => {
-    const { out, body } = await call(
-      { ...routes, "GET /job/app/5/testReport/api/json": 404 },
-      "getTestResults",
-      { jobFullName: "app" },
-    );
-    expect(out.isError).toBe(true);
-    expect(body.message).toMatch(/not available on this server/);
+  it("treats a missing testReport endpoint as no report, with a CLI hint", async () => {
+    const jenkins = mockJenkins({
+      "GET /crumbIssuer/api/json": 404,
+      ...routes,
+      "GET /job/app/5/testReport/api/json": 404,
+    });
+    const out = await runTool(session(jenkins.fetch), "getTestResults", { jobFullName: "app" });
+    expect(out.isError).toBe(false);
+    expect(parse(out.text).result).toBeUndefined();
+    expect(out.hints).toEqual([
+      "this build published no test report (testReport returned 404 for build #5)",
+    ]);
   });
 
   it("resolves summary like the plugin and abbreviates messages", () => {

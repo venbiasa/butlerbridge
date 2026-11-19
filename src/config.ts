@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { ToolError } from "./errors.js";
+import { compileUserRegex } from "./patterns.js";
 
 export interface ProfileConfig {
   url: string;
@@ -13,6 +14,10 @@ export interface ProfileConfig {
   maxTestCases?: number;
   triggerWaitMs?: number;
   allowInsecureHttp?: boolean;
+  redactPatterns?: string[];
+  maskEmails?: boolean;
+  collapseRepeats?: boolean;
+  compactSearch?: boolean;
 }
 
 export interface ConfigFile {
@@ -32,6 +37,12 @@ export interface ResolvedProfile {
   maxTestCases: number;
   triggerWaitMs: number;
   allowInsecureHttp: boolean;
+  redactPatterns: string[];
+  maskEmails: boolean;
+  /** MCP default for `collapseRepeats`; the CLI always defaults to true. */
+  collapseRepeats: boolean;
+  /** MCP default for searchBuildLog `compact`; the CLI always defaults to true. */
+  compactSearch: boolean;
   /** Where url/user came from, for `doctor` and `profiles`. */
   source: "config" | "env" | "config+env";
 }
@@ -40,8 +51,11 @@ export const DEFAULTS = {
   timeoutMs: 30_000,
   maxResultChars: 40_000,
   maxTestCases: 200,
-  triggerWaitMs: 0,
+  triggerWaitMs: 15_000,
 } as const;
+
+/** Smaller caps can't hold even an empty log page with its envelope. */
+export const MIN_RESULT_CHARS = 1_000;
 
 export const DEFAULT_PROFILE = "default";
 
@@ -67,6 +81,10 @@ const PROFILE_KEYS: Record<keyof ProfileConfig, "string" | "boolean" | "number" 
   maxTestCases: "number",
   triggerWaitMs: "number",
   allowInsecureHttp: "boolean",
+  redactPatterns: "string[]",
+  maskEmails: "boolean",
+  collapseRepeats: "boolean",
+  compactSearch: "boolean",
 };
 
 function findSecretKeys(value: unknown, path: string, found: string[]): void {
@@ -136,6 +154,18 @@ function validateProfile(name: string, p: unknown, file: string): ProfileConfig 
       throw new ToolError(`${file}: profile '${name}' key '${key}' must be a non-negative number`);
     }
   }
+  if (profile.maxResultChars !== undefined && profile.maxResultChars < MIN_RESULT_CHARS) {
+    throw new ToolError(
+      `${file}: profile '${name}' maxResultChars must be at least ${MIN_RESULT_CHARS}`,
+    );
+  }
+  (profile.redactPatterns ?? []).forEach((pattern, i) => {
+    try {
+      compileUserRegex(pattern, `redactPatterns[${i}]`, "g");
+    } catch (err) {
+      throw new ToolError(`${file}: profile '${name}': ${(err as Error).message}`);
+    }
+  });
   return profile;
 }
 
@@ -203,6 +233,10 @@ export function resolveProfile(
     maxTestCases: fromFile?.maxTestCases ?? DEFAULTS.maxTestCases,
     triggerWaitMs: fromFile?.triggerWaitMs ?? DEFAULTS.triggerWaitMs,
     allowInsecureHttp: fromFile?.allowInsecureHttp ?? false,
+    redactPatterns: fromFile?.redactPatterns ?? [],
+    maskEmails: fromFile?.maskEmails ?? false,
+    collapseRepeats: fromFile?.collapseRepeats ?? false,
+    compactSearch: fromFile?.compactSearch ?? false,
     source: fromFile ? (envUsed ? "config+env" : "config") : "env",
   };
 }

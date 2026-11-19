@@ -1,4 +1,4 @@
-import { isHttpStatus, ToolError } from "../errors.js";
+import { describeError, isHttpStatus, ToolError } from "../errors.js";
 import { couldContainMatch } from "../glob.js";
 import { buildPath, jobPath, normalizeBuildRef, parentAndName } from "../jobPath.js";
 import {
@@ -20,6 +20,7 @@ import {
   resolveTree,
   s,
   str,
+  type ToolContext,
   type ToolDef,
 } from "./types.js";
 
@@ -160,14 +161,50 @@ export const triggerBuild: ToolDef = {
         additionalProperties: { type: ["string", "boolean", "integer", "number", "array"] },
       },
       tree: s.tree(),
+      description: s.string(
+        "butlerbridge extension: once the build starts, set its description to 'triggered via butlerbridge: <text>' (needs allowWrite in the profile)",
+      ),
     },
     ["jobFullName"],
   ),
   async handler(args, ctx) {
     const job = reqStr(args, "jobFullName");
-    return scheduleBuild(ctx, job, obj(args, "parameters"), resolveTree(args));
+    const scheduled = await scheduleBuild(ctx, job, obj(args, "parameters"), resolveTree(args));
+    const description = str(args, "description")?.trim();
+    if (scheduled && description)
+      await describeTriggeredBuild(ctx, job, scheduled.build, description);
+    return scheduled?.item ?? null;
   },
 };
+
+/** Labels a build started by a tool. Never fails the trigger. */
+async function describeTriggeredBuild(
+  ctx: ToolContext,
+  job: string,
+  build: number | null,
+  text: string,
+): Promise<void> {
+  if (!ctx.profile.allowWrite) {
+    ctx.notes.push("Description not set: allowWrite is false for this profile.");
+    return;
+  }
+  if (build === null) {
+    ctx.notes.push("Description not set: the build had not started within triggerWaitMs.");
+    return;
+  }
+  try {
+    await ctx.client.post(
+      `${buildPath(job, build)}/submitDescription`,
+      new URLSearchParams({ description: `triggered via butlerbridge: ${text}` }),
+      { redirect: "manual" },
+    );
+    ctx.notes.push("Build description set.");
+  } catch (err) {
+    ctx.notes.push(
+      `Could not set the build description (${describeError(err)}); the build was still triggered.`,
+    );
+  }
+}
 
 export const updateBuild: ToolDef = {
   name: "updateBuild",
@@ -386,7 +423,7 @@ export const rebuildBuild: ToolDef = {
     ctx.notes.push(
       "Re-run with the original parameter values; trigger causes cannot be copied through the REST API.",
     );
-    return scheduleBuild(ctx, job, params, resolveTree(args));
+    return (await scheduleBuild(ctx, job, params, resolveTree(args)))?.item ?? null;
   },
 };
 

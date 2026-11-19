@@ -25,7 +25,20 @@ export interface ClientOptions {
   userAgent?: string;
   onWarning?: (message: string) => void;
   allowInsecureHttp?: boolean;
+  /** Called after every HTTP exchange, with the path only (no query, no headers). */
+  onRequest?: (record: RequestRecord) => void;
 }
+
+export interface RequestRecord {
+  method: string;
+  path: string;
+  /** HTTP status, or "timeout" / "network error". */
+  status: number | "timeout" | "network error";
+  ms: number;
+}
+
+/** Plain-HTTP warnings already printed in this process. */
+const warnedInsecure = new Set<string>();
 
 interface Crumb {
   field: string;
@@ -52,9 +65,12 @@ export class JenkinsClient {
             "Use https, or set allowInsecureHttp: true in the profile for a trusted internal network.",
         );
       }
-      opts.onWarning?.(
-        `Warning: talking to ${this.baseUrl} over plain HTTP (allowInsecureHttp). The API token is sent unencrypted.`,
-      );
+      if (!warnedInsecure.has(this.baseUrl)) {
+        warnedInsecure.add(this.baseUrl);
+        opts.onWarning?.(
+          `Warning: talking to ${this.baseUrl} over plain HTTP (allowInsecureHttp). The API token is sent unencrypted.`,
+        );
+      }
     }
   }
 
@@ -197,9 +213,15 @@ export class JenkinsClient {
     const controller = new AbortController();
     const signal = external ?? controller.signal;
     const timer = external ? undefined : setTimeout(() => controller.abort(), this.opts.timeoutMs);
+    const started = Date.now();
+    const record = (status: RequestRecord["status"]) =>
+      this.opts.onRequest?.({ method, path: url.pathname, status, ms: Date.now() - started });
     try {
-      return await this.fetchFn(url, { ...init, signal });
+      const res = await this.fetchFn(url, { ...init, signal });
+      record(res.status);
+      return res;
     } catch (err) {
+      record(signal.aborted ? "timeout" : "network error");
       if (signal.aborted) throw new JenkinsTimeoutError(method, path, this.opts.timeoutMs);
       const reason = (err as Error & { cause?: Error }).cause?.message ?? (err as Error).message;
       throw new ToolError(

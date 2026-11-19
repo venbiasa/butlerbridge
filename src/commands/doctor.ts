@@ -1,11 +1,12 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { BasicAuth } from "../auth.js";
 import { loadConfig, resolveProfile, type Env } from "../config.js";
 import { resolveToken } from "../credentials.js";
 import { describeError } from "../errors.js";
-import { runTool, sessionFor } from "../runtime.js";
+import { Redactor, type RedactionStats } from "../redact.js";
+import { redactorFor, runTool, sessionFor } from "../runtime.js";
 import type { CommandIO } from "./account.js";
 
 /** PATH a GUI-launched app typically gets: launchd's default on macOS, the session default on Linux. */
@@ -49,7 +50,59 @@ export function guiPathWarnings(platform: NodeJS.Platform, env: Env, nodePath: s
   ];
 }
 
+/**
+ * Runs the redactor of the selected profile (built-in rules only when none resolves) over a local
+ * file and prints which rules fired and how often. Never prints a matched value.
+ */
+export function redactionSample(
+  file: string,
+  flags: Map<string, string | true>,
+  io: CommandIO,
+): number {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (err) {
+    io.err(`Cannot read ${file}: ${(err as Error).message}`);
+    return 1;
+  }
+  let redactor: Redactor;
+  try {
+    const flag = flags.get("profile");
+    const profile = resolveProfile(
+      typeof flag === "string" ? flag : undefined,
+      io.env,
+      loadConfig(io.env).config,
+    );
+    redactor = redactorFor(profile);
+    io.out(`Rules: built-in plus profile '${profile.name}' settings.`);
+  } catch (err) {
+    redactor = new Redactor();
+    io.out(`Rules: built-in only (${describeError(err)}).`);
+  }
+  const stats: RedactionStats = new Map();
+  redactor.text(text, stats);
+  const lines = text.split("\n").length;
+  if (!stats.size) {
+    io.out(`No redactions in ${lines} line(s).`);
+    return 0;
+  }
+  io.out(`Redactions in ${lines} line(s), by rule (counts only):`);
+  for (const [rule, count] of [...stats].sort((a, b) => b[1] - a[1])) {
+    io.out(`  ${String(count).padStart(6)}  ${rule}`);
+  }
+  return 0;
+}
+
 export async function doctor(flags: Map<string, string | true>, io: CommandIO): Promise<number> {
+  const sample = flags.get("redaction-sample");
+  if (sample !== undefined) {
+    if (sample === true) {
+      io.err("--redaction-sample needs a file path");
+      return 2;
+    }
+    return redactionSample(sample, flags, io);
+  }
   let failed = false;
   const ok = (m: string) => io.out(`ok    ${m}`);
   const warn = (m: string) => io.out(`warn  ${m}`);
@@ -77,8 +130,11 @@ export async function doctor(flags: Map<string, string | true>, io: CommandIO): 
     try {
       profile = resolveProfile(typeof flag === "string" ? flag : undefined, io.env, loaded.config);
       ok(`profile '${profile.name}' → ${profile.url} as ${profile.user} (from ${profile.source})`);
-      if (profile.allowInsecureHttp && profile.url.startsWith("http://"))
-        warn("plain HTTP is allowed for this profile");
+      if (profile.allowInsecureHttp && profile.url.startsWith("http://")) {
+        warn(
+          "plain HTTP is allowed for this profile: the API token travels in cleartext over this connection",
+        );
+      }
     } catch (err) {
       return fail(`profile: ${describeError(err)}`);
     }
@@ -95,7 +151,7 @@ export async function doctor(flags: Map<string, string | true>, io: CommandIO): 
     }
     let session;
     try {
-      session = sessionFor(profile, new BasicAuth(profile.user, token), io.fetch, warn);
+      session = sessionFor(profile, new BasicAuth(profile.user, token), io.fetch);
     } catch (err) {
       return fail(`client: ${describeError(err)}`);
     }

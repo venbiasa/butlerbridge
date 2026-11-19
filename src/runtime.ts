@@ -3,8 +3,9 @@ import { loadConfig, resolveProfile, type Env, type ResolvedProfile } from "./co
 import { resolveToken, type CredentialStore } from "./credentials.js";
 import { describeError, ToolError } from "./errors.js";
 import { matchesAnyGlob } from "./glob.js";
-import { JenkinsClient, type FetchFn } from "./http.js";
-import { Redactor } from "./redact.js";
+import { JenkinsClient, type FetchFn, type RequestRecord } from "./http.js";
+import { compileUserRegex } from "./patterns.js";
+import { countRedactions, Redactor, type RedactionStats } from "./redact.js";
 import { findTool } from "./tools/index.js";
 import type { Args, ToolContext, ToolDef } from "./tools/types.js";
 import { VERSION } from "./version.js";
@@ -12,18 +13,30 @@ import { VERSION } from "./version.js";
 export const NO_DATA_MSG =
   "Search completed, but no results were found for the specified criteria.";
 export const DATA_MSG = "Data retrieved successfully.";
+/** Room kept for "(N values redacted)" when a tool sizes its own result. */
+const REDACTION_NOTE_ALLOWANCE = 40;
+
+export type Mode = "mcp" | "cli";
 
 /** Everything a tool call needs; one per process in serve mode, one per command in CLI mode. */
 export interface Session {
   profile: ResolvedProfile;
   client: JenkinsClient;
   redactor: Redactor;
+  mode: Mode;
+  /** Requests of the current call, for CLI diagnostics. Reset by every runTool. */
+  requests: RequestRecord[];
 }
 
 export interface ToolOutcome {
   isError: boolean;
   text: string;
   structured?: Record<string, unknown>;
+  /** True when the plugin's "no results" envelope was returned. */
+  noData?: boolean;
+  /** CLI-only explanations for stderr; never part of the MCP result. */
+  hints?: string[];
+  redactions?: number;
 }
 
 export interface SessionOptions {
@@ -32,6 +45,7 @@ export interface SessionOptions {
   store: CredentialStore;
   fetch?: FetchFn;
   warn?: (message: string) => void;
+  mode?: Mode;
 }
 
 export async function createSession(opts: SessionOptions): Promise<Session> {
@@ -39,7 +53,22 @@ export async function createSession(opts: SessionOptions): Promise<Session> {
   const { config } = loadConfig(env);
   const profile = resolveProfile(opts.profileFlag, env, config);
   const token = await resolveToken(profile.name, env, opts.store);
-  return sessionFor(profile, new BasicAuth(profile.user, token), opts.fetch, opts.warn);
+  return sessionFor(
+    profile,
+    new BasicAuth(profile.user, token),
+    opts.fetch,
+    opts.warn,
+    opts.mode ?? "mcp",
+  );
+}
+
+export function redactorFor(profile: ResolvedProfile, secrets: string[] = []): Redactor {
+  return new Redactor(secrets, {
+    customPatterns: profile.redactPatterns.map((p, i) =>
+      compileUserRegex(p, `redactPatterns[${i}]`, "g"),
+    ),
+    maskEmails: profile.maskEmails,
+  });
 }
 
 export function sessionFor(
@@ -47,8 +76,10 @@ export function sessionFor(
   auth: AuthProvider,
   fetchFn?: FetchFn,
   warn?: (message: string) => void,
+  mode: Mode = "mcp",
 ): Session {
-  const redactor = new Redactor(auth.secrets());
+  const redactor = redactorFor(profile, auth.secrets());
+  const requests: RequestRecord[] = [];
   const client = new JenkinsClient({
     baseUrl: profile.url,
     auth,
@@ -57,8 +88,11 @@ export function sessionFor(
     userAgent: `butlerbridge/${VERSION}`,
     allowInsecureHttp: profile.allowInsecureHttp,
     onWarning: (m) => warn?.(redactor.text(m)),
+    onRequest: (r) => {
+      if (mode === "cli") requests.push(r);
+    },
   });
-  return { profile, client, redactor };
+  return { profile, client, redactor, mode, requests };
 }
 
 export function writeGateError(tool: ToolDef, profile: ResolvedProfile): string | null {
@@ -73,10 +107,12 @@ function makeContext(session: Session): ToolContext {
   const allow = session.profile.jobAllowlist;
   const isJobAllowed = (fullName: string) =>
     !allow || matchesAnyGlob(fullName.replace(/^\/+|\/+$/g, ""), allow);
-  return {
+  const ctx: ToolContext = {
     client: session.client,
     profile: session.profile,
+    mode: session.mode,
     notes: [],
+    hints: [],
     isJobAllowed,
     assertJobAllowed(fullName) {
       if (!isJobAllowed(fullName)) {
@@ -85,7 +121,11 @@ function makeContext(session: Session): ToolContext {
         );
       }
     },
+    redactPreview: (text) => session.redactor.text(text),
+    measure: (result) =>
+      renderSuccess(session, result, ctx.notes, undefined).text.length + REDACTION_NOTE_ALLOWANCE,
   };
+  return ctx;
 }
 
 /** One entry point for both modes: validation, gates, the call, then redaction and size caps. */
@@ -94,6 +134,7 @@ export async function runTool(
   name: string,
   rawArgs: unknown,
 ): Promise<ToolOutcome> {
+  session.requests.length = 0;
   const tool = findTool(name);
   if (!tool) return failure(session, `Unknown tool '${name}'`);
   const ctx = makeContext(session);
@@ -104,9 +145,9 @@ export async function runTool(
     const job = tool.jobArg ? args[tool.jobArg] : undefined;
     if (typeof job === "string" && job.trim()) ctx.assertJobAllowed(job);
     const result = await tool.handler(args, ctx);
-    return success(session, tool, result, ctx.notes);
+    return success(session, tool, result, ctx);
   } catch (err) {
-    return failure(session, describeError(err));
+    return { ...failure(session, describeError(err)), hints: redactHints(session, ctx.hints) };
   }
 }
 
@@ -130,13 +171,38 @@ function isEmpty(value: unknown): boolean {
   return false;
 }
 
-function success(session: Session, tool: ToolDef, result: unknown, notes: string[]): ToolOutcome {
-  const safe = session.redactor.value(result);
+interface Rendered {
+  text: string;
+  safe: unknown;
+  empty: boolean;
+}
+
+/** The success envelope exactly as a client sees it, before the size cap. */
+function renderSuccess(
+  session: Session,
+  result: unknown,
+  notes: string[],
+  stats: RedactionStats | undefined,
+): Rendered {
+  const safe = session.redactor.value(result, stats);
   const empty = isEmpty(safe);
-  const message = [empty ? NO_DATA_MSG : DATA_MSG, ...notes].join(" ");
+  const redacted = stats ? countRedactions(stats) : 0;
+  const head = empty
+    ? NO_DATA_MSG
+    : redacted > 0
+      ? `Data retrieved successfully (${redacted} value${redacted === 1 ? "" : "s"} redacted).`
+      : DATA_MSG;
+  const message = [head, ...notes].join(" ");
   const body: Record<string, unknown> = { status: "COMPLETED", message };
   if (!empty) body.result = safe;
-  let text = JSON.stringify(body);
+  return { text: JSON.stringify(body), safe, empty };
+}
+
+function success(session: Session, tool: ToolDef, result: unknown, ctx: ToolContext): ToolOutcome {
+  const stats: RedactionStats = new Map();
+  const rendered = renderSuccess(session, result, ctx.notes, stats);
+  const { safe, empty } = rendered;
+  let text = rendered.text;
   let structured =
     tool.structured && !empty && typeof safe === "object"
       ? (safe as Record<string, unknown>)
@@ -144,6 +210,7 @@ function success(session: Session, tool: ToolDef, result: unknown, notes: string
 
   const max = session.profile.maxResultChars;
   if (max > 0 && text.length > max) {
+    const message = (JSON.parse(text) as { message: string }).message;
     const json = JSON.stringify(safe);
     const room = Math.max(0, max - message.length - 400);
     text = JSON.stringify({
@@ -156,7 +223,18 @@ function success(session: Session, tool: ToolDef, result: unknown, notes: string
     });
     structured = undefined;
   }
-  return { isError: false, text: session.redactor.literals(text), structured };
+  return {
+    isError: false,
+    text: session.redactor.literals(text, stats),
+    structured,
+    noData: empty,
+    hints: redactHints(session, ctx.hints),
+    redactions: countRedactions(stats),
+  };
+}
+
+function redactHints(session: Session, hints: string[]): string[] {
+  return hints.map((h) => session.redactor.text(h));
 }
 
 function failure(session: Session | null, message: string): ToolOutcome {

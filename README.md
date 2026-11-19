@@ -94,10 +94,14 @@ Config file: `~/.config/butlerbridge/config.json` (macOS and Linux) or
 | `allowWrite`        | `false` | enables write tools other than `triggerBuild`                                                    |
 | `jobAllowlist`      | none    | globs on job full names (`*` one segment, `**` any depth); calls outside fail before any request |
 | `timeoutMs`         | `30000` | per request; log streaming may take up to 4× this                                                |
-| `maxResultChars`    | `40000` | cap on what one tool call returns                                                                |
+| `maxResultChars`    | `40000` | cap on what one tool call returns; at least `1000`                                               |
 | `maxTestCases`      | `200`   | cap on test cases in test-result tools                                                           |
-| `triggerWaitMs`     | `0`     | `triggerBuild` waits up to this long for the queue item to get a build number                    |
+| `triggerWaitMs`     | `15000` | `triggerBuild` waits up to this long for the build to start; `0` returns the queue item at once  |
 | `allowInsecureHttp` | `false` | allow `http://` (the token then crosses the network unencrypted; a warning is printed)           |
+| `redactPatterns`    | none    | extra regexes to redact (each at most 1000 characters, checked when the config loads)            |
+| `maskEmails`        | `false` | show e-mail addresses as `j***@example.com`                                                      |
+| `collapseRepeats`   | `false` | fold repeated log lines in MCP results too (the CLI always does unless told not to)              |
+| `compactSearch`     | `false` | return `searchBuildLog` matches as `{line, text}` in MCP results too (the CLI's default)         |
 
 A config file that contains a token, password or secret is refused.
 
@@ -170,6 +174,11 @@ butlerbridge triggerBuild --jobFullName team/app --parameters.BRANCH main
 ```
 
 (`butlerbridge` stands for `npx -y github:<owner>/butlerbridge` unless you installed it globally.)
+When an answer is "no results", the CLI prints the requests behind it on stderr
+(`butlerbridge: GET /job/team/job/app/lastBuild/api/json → 404`, path only) and a hint where it
+knows one, such as _this build published no test report_. `--verbose` prints every request with
+its timing. The CLI folds repeated log lines and prints compact search matches by default; pass
+`--collapseRepeats false` or `--compact false` for the plugin's shape.
 `buildNumber` also takes `lastBuild`, `lastSuccessfulBuild`, `lastFailedBuild` and
 `lastCompletedBuild`. Job names are Jenkins full names (`folder/job`); a multibranch branch with a
 `/` in its name is written with `%2F` (`repo/feature%2Flogin`), as Jenkins names it.
@@ -235,6 +244,35 @@ Whether `mcp__jenkins__triggerBuild` also runs without asking is your call: it s
 builds. Leave it out to be asked each time, or add it if your jobs are safe to start freely.
 Keep the other write tools out of the list.
 
+## Reading CI logs efficiently
+
+CI logs are long and the interesting part is usually at the end. A few parameters keep the
+result small enough to read in one go:
+
+- **Start from the end.** `searchBuildLog --fromEnd true --maxMatches 5` returns the last five
+  matches, newest first, in one call, with their real line numbers. `getBuildLog` with no `skip`
+  returns the last 100 lines.
+- **Drop the noise.** `--excludePattern 'Download(ing|ed) |Progress \(\d+\)'` removes lines before
+  they're paged or searched; the message says how many were dropped.
+- **Fold repeats.** `--collapseRepeats true` turns 400 identical retry lines into one line ending
+  in `… repeated 400× (lines 120–519)`. Leading timestamps are ignored when comparing.
+- **Colour codes** are stripped by default (`--keepAnsi true` keeps them); patterns always match
+  the plain text.
+- **Page with cursors.** Both tools return `nextCursor` when there is more; pass it back as
+  `--cursor`. With `fromEnd`, a search cursor continues to older matches. `--startLine 1200`
+  starts a search at a known line instead.
+- **Use context, not bigger pages.** `--contextLines 3` on a search gives the lines around each
+  hit; that is usually cheaper than reading a page of log.
+
+Results always stay valid JSON: when a page or a search doesn't fit `maxResultChars`, butlerbridge
+returns fewer lines or matches with a `nextCursor`, and a single huge line is cut with
+`…[line truncated]`.
+
+```bash
+butlerbridge searchBuildLog --jobFullName team/app --buildNumber lastFailedBuild \
+  --pattern "ERROR|FAIL" --useRegex true --fromEnd true --maxMatches 5 --contextLines 2
+```
+
 ## What goes to the model
 
 Tool results go to the AI model: job and build data, log lines, test results, commit messages,
@@ -247,8 +285,14 @@ on text found in it. Before anything leaves butlerbridge (MCP and CLI alike):
   (also as JSON keys and as `*_TOKEN=`-style variables), AWS access key IDs, GCP service-account
   key fields, private key blocks, JWTs, and long opaque strings right after words like _token_
   or _secret_; build parameters whose name looks secret have their value hidden;
+- the profile's `redactPatterns` are applied, and e-mail addresses are masked with `maskEmails`;
 - results are capped (`maxResultChars`, log page size, search hit count, test case count), and
   the result message says what was cut and how to get the next page.
+
+The result message counts what was replaced, for example
+`Data retrieved successfully (3 values redacted).`, without showing the values. To see which
+rules fire on your own logs, save a log and run `butlerbridge doctor --redaction-sample build.log`:
+it prints rule names and counts only.
 
 What redaction does **not** catch: secrets in a shape it doesn't recognize (an unlabeled random
 string, a password inside free text, custom formats), secrets split across lines, or values

@@ -102,7 +102,7 @@ export async function scheduleBuild(
   job: string,
   params: Record<string, unknown> | undefined,
   tree: string | undefined,
-): Promise<Json | null> {
+): Promise<Scheduled | null> {
   const info = await ctx.client.jsonOrNull<Json>(`${jobPath(job)}/api/json`, {
     tree: "buildable,property[parameterDefinitions[name,type,choices]]",
   });
@@ -149,18 +149,49 @@ export function queueIdFromLocation(location: string | null): number | null {
 }
 
 /** Optional bounded wait (`triggerWaitMs`) for the queue item to turn into a build. */
+let queuePollMs = 1000;
+
+/** Tests shorten the queue polling interval. */
+export function setQueuePollMs(ms: number): void {
+  queuePollMs = ms;
+}
+
+export interface Scheduled {
+  item: Json;
+  /** Build number once the queue item turned into a build within triggerWaitMs. */
+  build: number | null;
+}
+
+/** Bounded wait (`triggerWaitMs`) for the queue item to turn into a build; explains the outcome in a note. */
 export async function waitForQueueItem(
   ctx: ToolContext,
   id: number,
   tree: string | undefined,
-): Promise<Json> {
-  const deadline = Date.now() + ctx.profile.triggerWaitMs;
-  while (ctx.profile.triggerWaitMs > 0 && Date.now() < deadline) {
-    const probe = await getQueueItemJson(ctx, id, "executable[number],cancelled");
-    if (!probe || probe.executable || probe.cancelled) break;
-    await new Promise((r) => setTimeout(r, Math.min(1000, Math.max(0, deadline - Date.now()))));
+): Promise<Scheduled> {
+  const waitMs = ctx.profile.triggerWaitMs;
+  const deadline = Date.now() + waitMs;
+  let probe: Json | null = null;
+  while (waitMs > 0) {
+    probe = await getQueueItemJson(ctx, id, "executable[number,url],cancelled,why");
+    if (!probe || probe.executable || probe.cancelled || Date.now() >= deadline) break;
+    await new Promise((r) =>
+      setTimeout(r, Math.min(queuePollMs, Math.max(0, deadline - Date.now()))),
+    );
   }
-  const item = await getQueueItemJson(ctx, id, tree);
-  if (item) return item;
-  return { id, url: `queue/item/${id}/` };
+  const executable = probe?.executable as { number?: unknown; url?: unknown } | undefined;
+  const build = typeof executable?.number === "number" ? executable.number : null;
+  if (build !== null) {
+    ctx.notes.push(
+      `Build #${build} started${typeof executable?.url === "string" ? `: ${executable.url}` : ""}.`,
+    );
+  } else if (probe?.cancelled) {
+    ctx.notes.push("The queue item was cancelled before a build started.");
+  } else if (waitMs > 0 && probe) {
+    const why = typeof probe.why === "string" && probe.why ? `: ${probe.why}` : "";
+    ctx.notes.push(
+      `Still queued after ${Math.round(waitMs / 1000)} s${why}. Poll getQueueItem with id ${id}.`,
+    );
+  }
+  const item = (await getQueueItemJson(ctx, id, tree)) ?? { id, url: `queue/item/${id}/` };
+  return { item, build };
 }

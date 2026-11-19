@@ -27,10 +27,15 @@ Every tool returns one text content item holding JSON (from `McpToolWrapper.toMc
 - Tools marked _structured_ also set `structuredContent` to the bare result and declare an
   `outputSchema`.
 
-butlerbridge additions, which only change the `message` text: when a cap shortened the result,
-the message says so and says how to get the rest (see [Safety](#safety-applied-to-every-tool)).
-When the whole serialized result is still larger than `maxResultChars`, `result` is replaced by
-`truncatedResult` (a string holding the start of the JSON) and the message explains it.
+butlerbridge additions, which only change the `message` text:
+
+- When a cap shortened the result, the message says so and says how to get the rest (see
+  [Safety](#safety-applied-to-every-tool)).
+- When redaction replaced anything, the success message carries the count:
+  `Data retrieved successfully (3 values redacted).` Only the count is shown, never the values.
+- When the whole serialized result is still larger than `maxResultChars`, `result` is replaced by
+  `truncatedResult` (a string holding the start of the JSON) and the message explains it. The two
+  log tools never take this path: they size their own pages so `result` always stays valid JSON.
 
 ### `tree` parameter
 
@@ -151,14 +156,25 @@ destructive).
 | jobFullName | string | **req** | "Full path of the Jenkins job (e.g., 'folder/job-name')"                                                                                         |
 | parameters  | object |         | "Build parameters (optional, e.g., {key1=value1,key2=value2})"; `additionalProperties: {"type":["string","boolean","integer","number","array"]}` |
 | tree        | string |         | no default: full queue item                                                                                                                      |
+| description | string |         | butlerbridge extension, see below                                                                                                                |
 
 Behaviour: for a parameterized job, every defined parameter gets the given value or its default;
 unknown keys are ignored; an invalid choice falls back to the default; file parameters are not
 supported. Result: the queue item, or `null` when the job doesn't exist or is not buildable.
 REST: read `property[parameterDefinitions[…]]`, then `POST /build` or `/buildWithParameters`
 (arrays joined with `,`), follow the `Location` header to `/queue/item/<id>/api/json`.
-butlerbridge extension (profile setting, not a parameter): `triggerWaitMs` waits up to that long
-for the queue item to get an `executable` (build number) before returning it.
+butlerbridge extensions:
+
+- `triggerWaitMs` (profile setting, default 15000; `0` returns at once like the plugin) polls the
+  queue item about once a second until it has an `executable` (number and url), is cancelled, or
+  the wait runs out. The result is the queue item as last seen. The message says which happened:
+  `Build #12 started: <url>.`, `The queue item was cancelled before a build started.`, or
+  `Still queued after 15 s: <why>. Poll getQueueItem with id <id>.`
+- `description` (optional): once the build has started, set its description to
+  `triggered via butlerbridge: <text>`. This needs `allowWrite: true` (it is the same call as
+  `updateBuild`); without it, or when the build has not started within the wait, the description is
+  skipped and the message says so. A failure to set it is reported in the message and never fails
+  the trigger.
 
 Deviation: the plugin adds an `MCPCause` ("Triggered via MCP Client from &lt;addr&gt;") to the
 build; over REST the build gets the ordinary `UserIdCause` of the token's user.
@@ -245,13 +261,16 @@ looked up from the job's `queueItem` (best effort: `null` if the build already l
 _"Retrieves some log lines with pagination for a specific build or the last build of a Jenkins
 job, … pass the returned 'nextCursor' back as 'cursor' …"_.
 
-| Param       | Type    | Req     | Notes                                                                                                    |
-| ----------- | ------- | ------- | -------------------------------------------------------------------------------------------------------- |
-| jobFullName | string  | **req** |                                                                                                          |
-| buildNumber | integer |         |                                                                                                          |
-| skip        | integer |         | negative = from the end, `-1` = last line                                                                |
-| limit       | integer |         | no skip and no limit → last 100 lines; with skip → 100 forward; negative = from the end; capped at 10000 |
-| cursor      | string  |         | opaque, tied to the build; `skip` ignored; line numbers come back `-1`                                   |
+| Param           | Type    | Req     | Notes                                                                                                    |
+| --------------- | ------- | ------- | -------------------------------------------------------------------------------------------------------- |
+| jobFullName     | string  | **req** |                                                                                                          |
+| buildNumber     | integer |         |                                                                                                          |
+| skip            | integer |         | negative = from the end, `-1` = last line                                                                |
+| limit           | integer |         | no skip and no limit → last 100 lines; with skip → 100 forward; negative = from the end; capped at 10000 |
+| cursor          | string  |         | opaque, tied to the build; `skip` ignored; line numbers come back `-1`                                   |
+| keepAnsi        | boolean |         | butlerbridge extension, see [Log text options](#log-text-options)                                        |
+| collapseRepeats | boolean |         | butlerbridge extension                                                                                   |
+| excludePattern  | string  |         | butlerbridge extension                                                                                   |
 
 Result `{lines: string[], hasMoreContent: bool, startLine, endLine, totalLines, nextCursor}`.
 `totalLines` is exact for end-relative reads, `-1` for forward and cursor reads. `nextCursor` is
@@ -260,20 +279,53 @@ REST: `GET /job/…/<n>/logText/progressiveText?start=<byte>` read as a stream (
 `X-More-Data`); forward reads stop as soon as the page is full. The cursor encodes build number,
 a byte offset Jenkins understands, and a line count inside that chunk.
 
+Deviations, all to keep the result valid JSON under `maxResultChars`:
+
+- The page is sized so the whole envelope fits. When fewer lines fit than were asked for, the page
+  is shortened, `hasMoreContent` is `true`, `nextCursor` points at the first line left out, and
+  the message says so. `truncatedResult` is never returned.
+- A single line too long for the budget on its own is cut and ends in `…[line truncated]`. Lines
+  longer than 4000 characters are always cut that way.
+- End-relative reads that don't fit keep the newest lines and say how many were dropped.
+- The plugin's two-part cursor still decodes.
+
+### Log text options
+
+Both log tools take three butlerbridge extensions. They apply before paging, counting and
+matching, so `skip`, `limit`, `maxMatches` and the cursors count what you see.
+
+- `keepAnsi` (default `false`): ANSI colour and cursor codes are stripped from the returned text.
+  Patterns always match the stripped text, so `ERROR` finds a red `ERROR` either way.
+  Deviation: the plugin returns the codes.
+- `collapseRepeats`: identical neighbouring lines, compared after leading timestamps are removed,
+  become one line followed by `… repeated N× (lines A–B)`. `A`–`B` are the real line numbers, or
+  are left out when line numbers are not known. Default: on in the CLI, off over MCP unless the
+  profile sets `collapseRepeats: true`, so MCP results match the plugin unless asked otherwise.
+- `excludePattern`: a regex (at most 1000 characters, same rules as `pattern`); matching lines are
+  dropped. The message reports how many were dropped and how many were folded.
+
+Line numbers in results always refer to the original log, so they can be passed back as `skip`
+or `startLine`.
+
 ### searchBuildLog — read
 
 _"Search for log lines matching a pattern in a specific build or the last build of a Jenkins
 job. Returns matching lines with their line numbers and context."_
 
-| Param        | Type    | Req     | Notes                               |
-| ------------ | ------- | ------- | ----------------------------------- |
-| jobFullName  | string  | **req** |                                     |
-| buildNumber  | integer |         |                                     |
-| pattern      | string  | **req** | non-empty; regex at most 1000 chars |
-| useRegex     | boolean |         | default false (plain `contains`)    |
-| ignoreCase   | boolean |         | default false                       |
-| maxMatches   | integer |         | default 100, max 1000               |
-| contextLines | integer |         | default 0, clamped to 0..10         |
+| Param                                     | Type    | Req     | Notes                                 |
+| ----------------------------------------- | ------- | ------- | ------------------------------------- |
+| jobFullName                               | string  | **req** |                                       |
+| buildNumber                               | integer |         |                                       |
+| pattern                                   | string  | **req** | non-empty; regex at most 1000 chars   |
+| useRegex                                  | boolean |         | default false (plain `contains`)      |
+| ignoreCase                                | boolean |         | default false                         |
+| maxMatches                                | integer |         | default 100, max 1000                 |
+| contextLines                              | integer |         | default 0, clamped to 0..10           |
+| fromEnd                                   | boolean |         | butlerbridge extension                |
+| cursor                                    | string  |         | butlerbridge extension                |
+| startLine                                 | integer |         | butlerbridge extension                |
+| compact                                   | boolean |         | butlerbridge extension                |
+| keepAnsi, collapseRepeats, excludePattern |         |         | [Log text options](#log-text-options) |
 
 Result `{pattern, useRegex, ignoreCase, matchCount, hasMoreMatches, totalLines, matches[]}`;
 each match `{matchedLineNumber, matchedLine, contextLines[], contextStartLine, contextEndLine}`
@@ -281,6 +333,34 @@ where `contextLines` holds the lines before, the matched line, and the lines aft
 trimmed. The scan stops early once the match budget is full and one extra match is seen; then
 `totalLines` is the number of lines scanned. Regexes use JavaScript syntax, which differs from
 Java's in edge cases.
+
+butlerbridge extensions:
+
+- `nextCursor` (added to the result, `null` when there is nothing more): pass it back as `cursor`
+  to continue right after the last match returned (before it, with `fromEnd`). The cursor is tied
+  to the build and the direction.
+- `startLine`: a 1-based line to start at, the non-opaque alternative to `cursor`. With
+  `fromEnd`, the search runs backwards from that line.
+- `fromEnd`: returns the **last** `maxMatches` matches, newest first, with their real line
+  numbers and context. `hasMoreMatches` means there are older matches.
+- `compact`: each match becomes `{line, text}`, or `{startLine, text}` with the context lines
+  joined by `\n` when `contextLines > 0`. Default: on in the CLI, off over MCP unless the profile
+  sets `compactSearch: true`. It is opt-in for MCP because the plugin's shape repeats the matched
+  line inside `contextLines` and adds two line numbers per hit; compact roughly halves a typical
+  result, but clients written against the plugin expect its shape.
+
+Why `fromEnd` is one forward pass: progressiveText only reads forward from a byte offset, and its
+offsets count bytes of the raw log (with console notes) while the text it returns has those notes
+stripped. A reverse page can't be aimed at "the 5000 lines before X" without reading up to X
+anyway, and line numbers could only be guessed. So butlerbridge streams the log once, keeps the
+newest `maxMatches` matches (with context) in a ring buffer, and returns them in one call with
+exact line numbers and bounded memory. The cost is reading the whole log, which a plain search
+already does.
+
+Deviation, to keep the result valid JSON under `maxResultChars`: matches are added one at a time
+while the envelope still fits. When the budget runs out first, `hasMoreMatches` is `true`,
+`nextCursor` continues from the last match kept, and the message says so. A single huge match is
+cut with `…[line truncated]`. `truncatedResult` is never returned.
 
 ### getJobScm — read
 
@@ -339,7 +419,10 @@ when blank), age}]}`
 - `failingTests`: full case records of failing tests
 - `TestResult`: the full `testReport` object.
 
-Empty map (→ empty-result envelope) when the build has no test report.
+Empty map (→ empty-result envelope) when the build has no test report. butlerbridge also returns
+the empty-result envelope (not an error) when `testReport` answers 404, which some servers do for
+builds without a report; the CLI then prints `butlerbridge: this build published no test report`
+on stderr.
 butlerbridge caps: at most `maxTestCases` (default 200) cases in any list, failing first,
 with a note in the message.
 
@@ -388,5 +471,17 @@ These run in butlerbridge, in both MCP and CLI mode, before and after each call:
    check the queued job before returning or cancelling.
 3. **Caps**: log pages stop at `maxResultChars`, long lines are clipped, search hits and test
    cases are capped; the message says what was cut and how to get more.
-4. **Redaction** of credentials and secret-looking values in every result and error.
+4. **Redaction** of credentials and secret-looking values in every result and error. The token
+   and the encoded credentials are removed wherever they appear, including inside truncated text.
+   The success message counts what was replaced. Profiles can add `redactPatterns` (regexes, each
+   at most 1000 characters, checked when the config loads) and turn on `maskEmails`
+   (`jane.doe@example.com` → `j***@example.com`). `butlerbridge doctor --redaction-sample <file>`
+   shows which rules fire on a sample, as rule names and counts only.
 5. Everything from Jenkins is returned as data.
+6. **Plain HTTP** is refused unless the profile allows it; then a warning is printed once per
+   process, and `doctor` says the token travels in cleartext.
+
+CLI only: when a call ends in the empty-result envelope, the CLI prints each request it made to
+stderr as `butlerbridge: GET <path> → 404` (path only, redacted, no headers or query), plus a hint
+where one is known. `--verbose` prints every request with its timing. MCP results never carry
+these lines.

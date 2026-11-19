@@ -1,8 +1,8 @@
 import { BasicAuth } from "../auth.js";
 import {
-  DEFAULTS,
   loadConfig,
   normalizeUrl,
+  resolveProfile,
   saveConfig,
   selectProfileName,
   type Env,
@@ -97,19 +97,7 @@ export async function login(flags: Map<string, string | true>, io: CommandIO): P
 }
 
 function resolvedFrom(name: string, p: ProfileConfig): ResolvedProfile {
-  return {
-    name,
-    url: p.url,
-    user: p.user,
-    allowWrite: p.allowWrite ?? false,
-    jobAllowlist: p.jobAllowlist ?? null,
-    timeoutMs: p.timeoutMs ?? DEFAULTS.timeoutMs,
-    maxResultChars: p.maxResultChars ?? DEFAULTS.maxResultChars,
-    maxTestCases: p.maxTestCases ?? DEFAULTS.maxTestCases,
-    triggerWaitMs: 0,
-    allowInsecureHttp: p.allowInsecureHttp ?? false,
-    source: "config",
-  };
+  return { ...resolveProfile(name, {}, { profiles: { [name]: p } }), triggerWaitMs: 0 };
 }
 
 export async function logout(flags: Map<string, string | true>, io: CommandIO): Promise<number> {

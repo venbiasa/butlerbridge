@@ -1,4 +1,4 @@
-import { isHttpStatus, ToolError } from "../errors.js";
+import { isHttpStatus } from "../errors.js";
 import { buildPath, normalizeBuildRef } from "../jobPath.js";
 import { resolveBuildNumber } from "./common.js";
 import {
@@ -17,6 +17,8 @@ type Json = Record<string, unknown>;
 export const MAX_ERROR_MESSAGE_LENGTH = 512;
 const TEST_RESULT_ACTION = "hudson.tasks.junit.TestResultAction";
 const FAILED = new Set(["FAILED", "REGRESSION"]);
+const NO_REPORT = "this build published no test report";
+
 const FLAKY_FIELDS = "flakyFailures[message,type,stackTrace,stdout,stderr]";
 const CASE_SUMMARY_FIELDS = `className,name,status,errorDetails,errorStackTrace,age,${FLAKY_FIELDS}`;
 
@@ -59,7 +61,10 @@ async function loadAction(
   buildNumberArg: unknown,
 ): Promise<{ number: number; action: Json } | null> {
   const number = await resolveBuildNumber(ctx, job, normalizeBuildRef(buildNumberArg));
-  if (number === null) return null;
+  if (number === null) {
+    ctx.hints.push(`no such build: ${job} ${String(buildNumberArg ?? "lastBuild")}`);
+    return null;
+  }
   const build = await ctx.client.jsonOrNull<{ actions?: Json[] }>(
     `${buildPath(job, number)}/api/json`,
     {
@@ -67,6 +72,7 @@ async function loadAction(
     },
   );
   const action = (build?.actions ?? []).find((a) => a?._class === TEST_RESULT_ACTION);
+  if (!action) ctx.hints.push(`${NO_REPORT} (build #${number} has no test result action)`);
   return action ? { number, action } : null;
 }
 
@@ -75,14 +81,13 @@ async function loadReport(
   job: string,
   number: number,
   tree?: string,
-): Promise<Json> {
+): Promise<Json | null> {
   try {
     return await ctx.client.json<Json>(`${buildPath(job, number)}/testReport/api/json`, { tree });
   } catch (err) {
     if (isHttpStatus(err, 404)) {
-      throw new ToolError(
-        "Test results are not available on this server: the junit plugin's testReport endpoint was not found",
-      );
+      ctx.hints.push(`${NO_REPORT} (testReport returned 404 for build #${number})`);
+      return null;
     }
     throw err;
   }
@@ -148,6 +153,7 @@ export const getTestResults: ToolDef = {
         found.number,
         `failCount,passCount,skipCount,suites[cases[${CASE_SUMMARY_FIELDS}]]`,
       );
+      if (!report) return {};
       const all = cases(report);
       const failed = all
         .filter((c) => FAILED.has(String(c.status)))
@@ -160,6 +166,8 @@ export const getTestResults: ToolDef = {
       const pass = Number(report.passCount ?? 0);
       const fail = Number(report.failCount ?? 0);
       const skip = Number(report.skipCount ?? 0);
+      if (fail === 0)
+        ctx.hints.push(`the test report of build #${found.number} has no failing tests`);
       response.TestResultSummary = {
         buildNumber: found.number,
         totalCount: pass + fail + skip,
@@ -171,6 +179,7 @@ export const getTestResults: ToolDef = {
       };
     } else if (onlyFailing) {
       const report = await loadReport(ctx, job, found.number, "suites[cases[*,flakyFailures[*]]]");
+      if (!report) return {};
       response.failingTests = capList(
         ctx,
         cases(report).filter((c) => FAILED.has(String(c.status))),
@@ -178,6 +187,7 @@ export const getTestResults: ToolDef = {
       );
     } else {
       const report = await loadReport(ctx, job, found.number);
+      if (!report) return {};
       const all = cases(report);
       if (all.length > ctx.profile.maxTestCases) {
         const ordered = [
@@ -237,6 +247,7 @@ export const getFlakyFailures: ToolDef = {
         found.number,
         `suites[cases[className,name,${FLAKY_FIELDS}]]`,
       );
+      if (!report) return {};
       const flakyTests = cases(report)
         .filter((c) => flaky(c).length > 0)
         .map((c) => ({
@@ -260,6 +271,7 @@ export const getFlakyFailures: ToolDef = {
         found.number,
         "suites[cases[duration,className,name,skippedMessage,skipped,errorStackTrace,errorDetails,failedSince,stdout,stderr,properties,flakyFailures[*]]]",
       );
+      if (!report) return {};
       const list = cases(report)
         .filter((c) => flaky(c).length > 0)
         .map((c) => ({

@@ -14,8 +14,16 @@ export interface ToolAnnotations {
 export interface ToolContext {
   client: JenkinsClient;
   profile: ResolvedProfile;
+  /** CLI and MCP share tools but not every default (compact search, collapsing repeats). */
+  mode: "mcp" | "cli";
   /** Sentences appended to the result message, e.g. what a cap cut off. */
   notes: string[];
+  /** CLI-only explanations printed to stderr, e.g. why a result is empty. */
+  hints: string[];
+  /** Redacts like the final output does, without counting; for sizing results. */
+  redactPreview(text: string): string;
+  /** Length of the envelope this result would produce, so a tool can fit under maxResultChars. */
+  measure(result: unknown): number;
   isJobAllowed(fullName: string): boolean;
   assertJobAllowed(fullName: string): void;
 }

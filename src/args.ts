@@ -42,7 +42,7 @@ export function parseArgv(argv: readonly string[]): ParsedArgv {
   return { command, flags, positionals };
 }
 
-export const GLOBAL_FLAGS = new Set(["profile", "pretty", "help", "json"]);
+export const GLOBAL_FLAGS = new Set(["profile", "pretty", "help", "json", "verbose"]);
 
 function propType(tool: ToolDef, name: string): string | string[] | undefined {
   const props = tool.inputSchema.properties as

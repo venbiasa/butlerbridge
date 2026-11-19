@@ -64,6 +64,10 @@ export function profile(overrides: Partial<ResolvedProfile> = {}): ResolvedProfi
     maxTestCases: DEFAULTS.maxTestCases,
     triggerWaitMs: 0,
     allowInsecureHttp: false,
+    redactPatterns: [],
+    maskEmails: false,
+    collapseRepeats: false,
+    compactSearch: false,
     source: "config",
     ...overrides,
   };
