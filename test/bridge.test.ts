@@ -1,15 +1,10 @@
-import { createDecipheriv, createECDH, createHmac } from "node:crypto";
-import { createServer, request as httpRequest } from "node:http";
-import type { AddressInfo } from "node:net";
+import { signRequest, verifyResponse } from "ridealong";
 import { afterEach, describe, expect, it } from "vitest";
 import { MemoryStore } from "../src/credentials.js";
 import {
   BRIDGE_TOKEN_ACCOUNT,
   BridgeHost,
-  pairingKey,
-  signBridgeRequest,
   startBridge,
-  verifyBridgeResponse,
   withJenkinsLogin,
   type Bridge,
 } from "../src/bridge.js";
@@ -39,7 +34,7 @@ async function call(
   body?: string,
   token = TOKEN,
 ): Promise<{ status: number; text: string; verified: boolean }> {
-  const { headers, nonce } = signBridgeRequest(token, method, path, body ?? "");
+  const { headers, nonce } = signRequest(token, method, path, body ?? "");
   const res = await fetch(`${base(port)}${path}`, {
     method,
     headers: { ...headers, ...(body != null ? { "content-type": "application/json" } : {}) },
@@ -50,7 +45,7 @@ async function call(
   return {
     status: res.status,
     text,
-    verified: verifyBridgeResponse(token, nonce, res.status, text, proof),
+    verified: verifyResponse(token, nonce, res.status, text, proof),
   };
 }
 
@@ -59,21 +54,6 @@ const getWork = async (b: Bridge): Promise<Work> =>
   JSON.parse((await call(b.port, "GET", "/poll")).text) as Work;
 const postResult = (b: Bridge, reply: Record<string, unknown>) =>
   call(b.port, "POST", "/result", JSON.stringify(reply));
-
-/** A raw request so we can set the Host header (fetch() forbids it) or replay exact headers. */
-function rawGet(b: Bridge, path: string, headers: Record<string, string>): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const req = httpRequest(
-      { host: "127.0.0.1", port: b.port, path, method: "GET", headers },
-      (res) => {
-        res.resume();
-        resolve(res.statusCode ?? 0);
-      },
-    );
-    req.on("error", reject);
-    req.end();
-  });
-}
 
 describe("bridge transport", () => {
   it("forwards a request to the extension and returns its response", async () => {
@@ -123,185 +103,6 @@ describe("bridge transport", () => {
     const p = b.fetch(JOB, { signal: controller.signal });
     controller.abort();
     await expect(p).rejects.toThrow(/abort/i);
-  });
-});
-
-describe("bridge mutual authentication", () => {
-  it("signs every response, including an idle poll", async () => {
-    const b = await make(30);
-    const health = await call(b.port, "GET", "/health");
-    expect(health).toMatchObject({ status: 200, verified: true });
-    const idle = await call(b.port, "GET", "/poll");
-    expect(idle).toMatchObject({ status: 204, verified: true });
-  });
-
-  it("never puts the token on the wire", () => {
-    const { headers } = signBridgeRequest(TOKEN, "GET", "/poll");
-    expect(JSON.stringify(headers)).not.toContain(TOKEN);
-  });
-
-  it("rejects unsigned, wrongly signed and path-tampered requests", async () => {
-    const b = await make();
-    expect((await fetch(`${base(b.port)}/health`)).status).toBe(401);
-    expect((await call(b.port, "GET", "/health", undefined, "wrong-token")).status).toBe(401);
-    const { headers } = signBridgeRequest(TOKEN, "GET", "/health");
-    expect((await fetch(`${base(b.port)}/poll`, { headers })).status).toBe(401);
-  });
-
-  it("refuses a replayed request and one outside the clock window", async () => {
-    const b = await make();
-    const { headers } = signBridgeRequest(TOKEN, "GET", "/health");
-    expect(await rawGet(b, "/health", headers)).toBe(200);
-    expect(await rawGet(b, "/health", headers)).toBe(401);
-    const stale = signBridgeRequest(TOKEN, "GET", "/health").headers;
-    expect(
-      await rawGet(b, "/health", { ...stale, "x-ridealong-ts": String(Date.now() - 600_000) }),
-    ).toBe(401);
-  });
-
-  it("a squatter on the port cannot prove itself or learn the token", async () => {
-    const seen: string[] = [];
-    const squatter = createServer((req, res) => {
-      seen.push(JSON.stringify(req.headers));
-      res.setHeader("x-ridealong-proof", "0".repeat(64));
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ id: "x", method: "GET", url: "https://mail.example.com/inbox" }));
-    });
-    await new Promise<void>((r) => squatter.listen(0, "127.0.0.1", r));
-    const { port } = squatter.address() as AddressInfo;
-    const res = await call(port, "GET", "/poll");
-    await new Promise<void>((r) => squatter.close(() => r()));
-    expect(res.verified).toBe(false);
-    expect(seen.join("")).not.toContain(TOKEN);
-  });
-
-  it("ignores a forged unsigned result", async () => {
-    const b = await make();
-    const p = b.fetch(JOB);
-    const work = await getWork(b);
-    const forged = await fetch(`${base(b.port)}/result`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        id: work.id,
-        status: 200,
-        bodyB64: Buffer.from("forged").toString("base64"),
-      }),
-    });
-    expect(forged.status).toBe(401);
-    await postResult(b, {
-      id: work.id,
-      status: 200,
-      bodyB64: Buffer.from("real").toString("base64"),
-    });
-    expect(await (await p).text()).toBe("real");
-  });
-
-  it("rejects a non-extension Origin even when signed", async () => {
-    const b = await make();
-    const { headers } = signBridgeRequest(TOKEN, "GET", "/health");
-    const res = await fetch(`${base(b.port)}/health`, {
-      headers: { ...headers, origin: "https://evil.example" },
-    });
-    expect(res.status).toBe(401);
-  });
-
-  it("rejects a mismatched Host header (DNS rebinding)", async () => {
-    const b = await make();
-    const signed = () => signBridgeRequest(TOKEN, "GET", "/health").headers;
-    expect(await rawGet(b, "/health", { ...signed(), host: "evil.example" })).toBe(403);
-    expect(await rawGet(b, "/health", { ...signed(), host: `127.0.0.1:${b.port}` })).toBe(200);
-  });
-});
-
-/** The extension's pairing handshake, in Node crypto. Returns the token, or null if refused. */
-async function pairClient(port: number, secret: string): Promise<string | null> {
-  const keyRes = await fetch(`${base(port)}/pair/key`);
-  if (!keyRes.ok) return null;
-  const { pub: bridgePub } = (await keyRes.json()) as { pub: string };
-  const mine = createECDH("prime256v1");
-  mine.generateKeys();
-  const extensionPub = mine.getPublicKey().toString("base64url");
-  const shared = mine.computeSecret(Buffer.from(bridgePub, "base64url"));
-  const key = pairingKey(secret, shared, bridgePub, extensionPub);
-  const confirm = createHmac("sha256", key).update("ridealong-v1|pair-client").digest("hex");
-  const res = await fetch(`${base(port)}/pair/claim`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ pub: extensionPub, confirm }),
-  });
-  if (!res.ok) return null;
-  const { iv, ct } = (await res.json()) as { iv: string; ct: string };
-  const sealed = Buffer.from(ct, "base64url");
-  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(iv, "base64url"));
-  decipher.setAAD(Buffer.from("ridealong-v1|pair-token"));
-  decipher.setAuthTag(sealed.subarray(sealed.length - 16));
-  return Buffer.concat([
-    decipher.update(sealed.subarray(0, sealed.length - 16)),
-    decipher.final(),
-  ]).toString("utf8");
-}
-
-describe("bridge click-to-pair", () => {
-  const secretOf = (url: string) => new URL(url).hash.slice(1);
-
-  async function pairable(): Promise<{ b: Bridge; urls: string[]; paired: () => number }> {
-    const urls: string[] = [];
-    let paired = 0;
-    const b = await startBridge({
-      port: 0,
-      pollTimeoutMs: 30,
-      onPairingUrl: (u) => urls.push(u),
-      onPaired: () => paired++,
-    });
-    bridges.push(b);
-    return { b, urls, paired: () => paired };
-  }
-
-  it("hands the token over once to the holder of the link's secret", async () => {
-    const { b, urls, paired } = await pairable();
-    b.pair();
-    expect(urls).toHaveLength(1);
-    expect(urls[0]).toMatch(
-      new RegExp(`^http://127\\.0\\.0\\.1:${b.port}/pair#[A-Za-z0-9_-]{43}$`),
-    );
-    const secret = secretOf(urls[0]!);
-    expect(await pairClient(b.port, "x".repeat(43))).toBeNull();
-    expect(await pairClient(b.port, secret)).toBe(b.token);
-    expect(paired()).toBe(1);
-    expect(await pairClient(b.port, secret)).toBeNull();
-    expect((await call(b.port, "GET", "/health", undefined, b.token)).status).toBe(200);
-  });
-
-  it("serves a pairing page that carries neither secret nor token", async () => {
-    const { b, urls } = await pairable();
-    b.pair();
-    const page = await (await fetch(`${base(b.port)}/pair`)).text();
-    expect(page).not.toContain(secretOf(urls[0]!));
-    expect(page).not.toContain(b.token);
-  });
-
-  it("re-opens the page on an extension's request, rate-limited", async () => {
-    const { b, urls } = await pairable();
-    const ask = () => fetch(`${base(b.port)}/pair/request`, { method: "POST" });
-    expect((await ask()).status).toBe(202);
-    expect((await ask()).status).toBe(202);
-    expect(urls).toHaveLength(1);
-  });
-
-  it("refuses pairing requests from a web page", async () => {
-    const { b, urls } = await pairable();
-    const res = await fetch(`${base(b.port)}/pair/request`, {
-      method: "POST",
-      headers: { origin: "https://evil.example" },
-    });
-    expect(res.status).toBe(401);
-    expect(urls).toHaveLength(0);
-  });
-
-  it("offers no pairing key until pairing starts", async () => {
-    const { b } = await pairable();
-    expect((await fetch(`${base(b.port)}/pair/key`)).status).toBe(404);
   });
 });
 

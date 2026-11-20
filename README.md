@@ -279,7 +279,7 @@ If your Jenkins sits behind Google IAP, Cloudflare Access or an SSO proxy with *
 command-line access**, the normal API-token transport can't get through: the gateway only accepts a
 browser sign-in. The optional **bridge transport** lets butlerbridge read Jenkins through your own
 already-signed-in browser session, so you authenticate the way you always do and no credential is
-copied out of the browser. It pairs with **[ridealong](https://github.com/<owner>/ridealong)**, a
+copied out of the browser. It pairs with **[ridealong](https://github.com/venbiasa/ridealong)**, a
 standalone browser extension that runs requests inside your session.
 
 Create a bridge profile. It saves only the URL with `"transport": "bridge"`: no user, no API token,
@@ -338,7 +338,7 @@ request and response with it, so a program squatting on the port can neither lea
 work; the bridge binds to `127.0.0.1` and checks the request `Origin` and `Host`; and ridealong keeps
 the token in its own extension storage (never web-page storage) and talks only to hosts you allowed, over https. It needs no change from
 your IAP administrators — but if your organization blocks unpacked extensions by policy
-(`chrome://policy`), this route is closed. See the [ridealong](https://github.com/<owner>/ridealong)
+(`chrome://policy`), this route is closed. See the [ridealong](https://github.com/venbiasa/ridealong)
 project for the extension, the protocol and the full security model.
 
 ## What goes to the model
@@ -385,6 +385,11 @@ the REST API couldn't match it (listed in [docs/tool-contract.md](docs/tool-cont
 Then `butlerbridge logout` and revoke the token you made for butlerbridge.
 
 ## Development
+
+The bridge comes from [ridealong](https://github.com/venbiasa/ridealong), installed from GitHub by version tag
+(`#semver:^0.1.0`), pinned to one commit in `package-lock.json`. `npm update ridealong` takes a newer
+matching tag; a new major (or minor, while it is 0.x) needs the range raised.
+To try local ridealong changes first, `npm link ../ridealong`, and `npm install` to go back.
 
 ```bash
 npm install
