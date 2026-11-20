@@ -22,12 +22,11 @@ butlerbridge is an independent project. It is not part of, or endorsed by, the J
 Needs Node.js 18.17 or newer (`node -v`). Nothing to compile on your side.
 
 ```bash
-npx -y github:<owner>/butlerbridge --version
+npx -y github:venbiasa/butlerbridge --version
 ```
 
-Replace `<owner>` with the GitHub account that hosts this repository. The first run downloads
-and builds it; later runs use npm's cache. Once it is published to npm, `npx -y butlerbridge`
-works the same way.
+The first run downloads and builds it; later runs use npm's cache. Once it is published to npm,
+`npx -y butlerbridge` works the same way.
 
 ## Log in
 
@@ -36,7 +35,7 @@ Create a **dedicated API token for this tool** in Jenkins: your user name (top r
 own without breaking anything else. Then:
 
 ```bash
-npx -y github:<owner>/butlerbridge login
+npx -y github:venbiasa/butlerbridge login
 ```
 
 It asks for the Jenkins URL, your user name and the token (hidden). It checks the token with
@@ -45,7 +44,7 @@ Linux Secret Service; service `butlerbridge`, account = profile name) and the re
 file. Then check everything:
 
 ```bash
-npx -y github:<owner>/butlerbridge doctor
+npx -y github:venbiasa/butlerbridge doctor
 ```
 
 `doctor` checks the config, the credential store, that Jenkins is reachable, `whoAmI`, and that
@@ -57,7 +56,7 @@ Jenkins too when you no longer need it.
 Non-interactive login (for scripts):
 
 ```bash
-printf '%s' "$TOKEN" | npx -y github:<owner>/butlerbridge login --url https://ci.example.com --user me --token-stdin
+printf '%s' "$TOKEN" | npx -y github:venbiasa/butlerbridge login --url https://ci.example.com --user me --token-stdin
 ```
 
 ## Profiles
@@ -112,7 +111,7 @@ config file at all. With `JENKINS_TOKEN` set, the OS credential store is never t
 
 ```bash
 JENKINS_URL=https://ci.example.com JENKINS_USER=bot JENKINS_TOKEN=*** \
-  npx -y github:<owner>/butlerbridge getBuild --jobFullName team/app --pretty
+  npx -y github:venbiasa/butlerbridge getBuild --jobFullName team/app --pretty
 ```
 
 ## Use it from an MCP client
@@ -123,7 +122,7 @@ as with the official plugin.
 **Claude Code**
 
 ```bash
-claude mcp add jenkins -- npx -y github:<owner>/butlerbridge serve
+claude mcp add jenkins -- npx -y github:venbiasa/butlerbridge serve
 ```
 
 Add `--profile <name>` after `serve` to pin a profile.
@@ -135,7 +134,7 @@ Add `--profile <name>` after `serve` to pin a profile.
   "mcpServers": {
     "jenkins": {
       "command": "npx",
-      "args": ["-y", "github:<owner>/butlerbridge", "serve"]
+      "args": ["-y", "github:venbiasa/butlerbridge", "serve"]
     }
   }
 }
@@ -152,7 +151,7 @@ give the server a `PATH` that includes node's directory:
   "mcpServers": {
     "jenkins": {
       "command": "/opt/homebrew/bin/npx",
-      "args": ["-y", "github:<owner>/butlerbridge", "serve"],
+      "args": ["-y", "github:venbiasa/butlerbridge", "serve"],
       "env": { "PATH": "/opt/homebrew/bin:/usr/bin:/bin" }
     }
   }
@@ -173,7 +172,7 @@ butlerbridge triggerBuild --jobFullName team/app --parameters '{"BRANCH":"main"}
 butlerbridge triggerBuild --jobFullName team/app --parameters.BRANCH main
 ```
 
-(`butlerbridge` stands for `npx -y github:<owner>/butlerbridge` unless you installed it globally.)
+(`butlerbridge` stands for `npx -y github:venbiasa/butlerbridge` unless you installed it globally.)
 When an answer is "no results", the CLI prints the requests behind it on stderr
 (`butlerbridge: GET /job/team/job/app/lastBuild/api/json → 404`, path only) and a hint where it
 knows one, such as _this build published no test report_. `--verbose` prints every request with
