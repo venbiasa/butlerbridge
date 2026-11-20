@@ -138,6 +138,10 @@ export async function doctor(flags: Map<string, string | true>, io: CommandIO): 
     } catch (err) {
       return fail(`profile: ${describeError(err)}`);
     }
+    if (profile.transport === "bridge") {
+      ok("transport: bridge (the ridealong extension signs in through your browser; no API token)");
+      return;
+    }
     let token;
     try {
       token = await resolveToken(profile.name, io.env, io.store);

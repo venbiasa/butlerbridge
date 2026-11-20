@@ -273,6 +273,74 @@ butlerbridge searchBuildLog --jobFullName team/app --buildNumber lastFailedBuild
   --pattern "ERROR|FAIL" --useRegex true --fromEnd true --maxMatches 5 --contextLines 2
 ```
 
+## Jenkins behind a browser-only gateway (IAP / SSO)
+
+If your Jenkins sits behind Google IAP, Cloudflare Access or an SSO proxy with **no sanctioned
+command-line access**, the normal API-token transport can't get through: the gateway only accepts a
+browser sign-in. The optional **bridge transport** lets butlerbridge read Jenkins through your own
+already-signed-in browser session, so you authenticate the way you always do and no credential is
+copied out of the browser. It pairs with **[ridealong](https://github.com/<owner>/ridealong)**, a
+standalone browser extension that runs requests inside your session.
+
+Create a bridge profile. It saves only the URL with `"transport": "bridge"`: no user, no API token,
+because the gateway turns every token away before Jenkins sees it. (A token profile pointed at such a
+Jenkins fails with a message saying so, and prints this command.)
+
+```bash
+butlerbridge login --bridge --profile iap --url https://jenkins.example.com
+```
+
+Then serve or call tools as usual:
+
+```bash
+BUTLERBRIDGE_PROFILE=iap butlerbridge serve
+```
+
+(`serve --bridge` forces the bridge for any profile.) Nothing starts until the first call to a
+bridge profile; then a bridge listens on `127.0.0.1` port `8731` (`--bridge-port` to change it).
+
+- **Pair once.** The bridge token is kept in the OS credential store (account `:ridealong-bridge`),
+  so every later run reuses it and a paired extension stays paired. The pairing page opens only when
+  the extension isn't paired: install ridealong and click **Pair**. `BUTLERBRIDGE_BRIDGE_TOKEN`
+  overrides the stored token.
+- **Allow the host once.** The first call opens ridealong's **Allow access** page for your Jenkins
+  host: click **Allow**. Then open Jenkins in the same browser and sign in.
+- **The first call can be slow.** It may wait up to 30 s for the extension to notice a new bridge,
+  plus any clicks, so bridge profiles default to `timeoutMs` 90 000.
+- **One bridge per port.** A second session on the same port fails with a clear "port in use"
+  message; close the other one, or use another `--bridge-port` and set it in the extension's options.
+- **Jenkins' own login is renewed for you.** It lapses separately from the gateway's, and only a page
+  load renews it. So before calls (at most once a minute, and after a 403) butlerbridge asks Jenkins
+  `whoAmI`. If the answer is anonymous, the extension opens Jenkins in a background tab that closes
+  itself, then butlerbridge checks again. If Jenkins still wants a manual sign-in, the tab stays open
+  and the call fails with a sign-in message rather than returning anonymous data.
+
+Every call of a bridge profile goes through the bridge. Reads (`getBuildLog`, `searchBuildLog`,
+`getBuild`, `getTestResults`, …) are verified that way; write tools (`triggerBuild` and the
+`allowWrite` ones) have not been tried through it yet.
+
+**Different Jenkins per project.** Register the server per project, not user-wide, and leave
+`defaultProfile` out of the config, so a project without a registration has no Jenkins tools instead
+of silently reading the wrong Jenkins. Run this once from each project's root; it is kept in your
+client config, keyed to that folder, and never committed. Desktop MCP clients start servers without
+your shell's PATH, so pass absolute paths:
+
+```bash
+claude mcp add --scope local butlerbridge \
+  -e PATH="$(dirname "$(command -v node)"):/usr/bin:/bin" -e BUTLERBRIDGE_PROFILE=<profile> \
+  -- "$(command -v butlerbridge)" serve
+```
+
+Why it's safe: the IAP and Jenkins cookies never leave the browser (butlerbridge only receives the
+response bytes); pairing hands the token over encrypted, under a key derived from a one-time link
+secret and an ECDH exchange, and after that it is never sent — the extension and the bridge sign every
+request and response with it, so a program squatting on the port can neither learn it nor feed the extension
+work; the bridge binds to `127.0.0.1` and checks the request `Origin` and `Host`; and ridealong keeps
+the token in its own extension storage (never web-page storage) and talks only to hosts you allowed, over https. It needs no change from
+your IAP administrators — but if your organization blocks unpacked extensions by policy
+(`chrome://policy`), this route is closed. See the [ridealong](https://github.com/<owner>/ridealong)
+project for the extension, the protocol and the full security model.
+
 ## What goes to the model
 
 Tool results go to the AI model: job and build data, log lines, test results, commit messages,

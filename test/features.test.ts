@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -449,4 +449,52 @@ describe("credentials never leak", () => {
       });
     }
   }
+});
+
+describe("Jenkins behind a browser-only gateway", () => {
+  const iapSignIn = (async () =>
+    new Response("<html>sign in</html>", {
+      status: 401,
+      headers: { "x-goog-iap-generated-response": "true" },
+    })) as unknown as FetchFn;
+
+  it("says no token can pass and points at the bridge, instead of blaming the credentials", async () => {
+    const { code, out } = await cli(["whoAmI"], iapSignIn);
+    expect(code).toBe(1);
+    expect(parse(out).message).toMatch(/browser sign-in gateway/);
+    expect(parse(out).message).toMatch(/login --profile <name> --url .* --bridge/);
+  });
+
+  it("recognizes a bounce to a sign-in page on another host", async () => {
+    const bounced = (async () => {
+      const res = new Response("<html>sign in</html>", { status: 200 });
+      Object.defineProperty(res, "redirected", { value: true });
+      Object.defineProperty(res, "url", { value: "https://accounts.example.test/signin" });
+      return res;
+    }) as unknown as FetchFn;
+    const { out } = await cli(["whoAmI"], bounced);
+    expect(parse(out).message).toMatch(/browser sign-in gateway/);
+  });
+
+  it("login --bridge saves a token-free bridge profile that is not the default", async () => {
+    const config = join(dir, "bridge-login.json");
+    writeFileSync(config, JSON.stringify({ profiles: {} }));
+    const store = new MemoryStore();
+    const out: string[] = [];
+    const code = await runCli(
+      ["login", "--bridge", "--profile", "iap", "--url", "https://iap.example.test/"],
+      {
+        env: { BUTLERBRIDGE_CONFIG: config },
+        store,
+        out: (l) => out.push(l),
+        err: () => {},
+      },
+    );
+    expect(code).toBe(0);
+    const saved = parseConfig(readFileSync(config, "utf8"));
+    expect(saved.profiles.iap).toEqual({ url: "https://iap.example.test", transport: "bridge" });
+    expect(saved.defaultProfile).toBeUndefined();
+    expect(store.tokens.size).toBe(0);
+    expect(out.join("\n")).toMatch(/No API token/);
+  });
 });

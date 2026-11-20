@@ -4,9 +4,14 @@ import { dirname, join } from "node:path";
 import { ToolError } from "./errors.js";
 import { compileUserRegex } from "./patterns.js";
 
+/** How requests reach Jenkins: an API token, or the user's browser session via ridealong. */
+export type Transport = "token" | "bridge";
+
 export interface ProfileConfig {
   url: string;
-  user: string;
+  /** Not needed with the bridge transport, which signs in through the browser. */
+  user?: string;
+  transport?: Transport;
   allowWrite?: boolean;
   jobAllowlist?: string[];
   timeoutMs?: number;
@@ -30,6 +35,7 @@ export interface ResolvedProfile {
   name: string;
   url: string;
   user: string;
+  transport: Transport;
   allowWrite: boolean;
   jobAllowlist: string[] | null;
   timeoutMs: number;
@@ -49,6 +55,8 @@ export interface ResolvedProfile {
 
 export const DEFAULTS = {
   timeoutMs: 30_000,
+  /** The first bridge call may wait for the extension to wake, a pairing click, or an Allow click. */
+  bridgeTimeoutMs: 90_000,
   maxResultChars: 40_000,
   maxTestCases: 200,
   triggerWaitMs: 15_000,
@@ -74,6 +82,7 @@ const SECRET_KEY = /token|password|passwd|secret|apikey|api_key/i;
 const PROFILE_KEYS: Record<keyof ProfileConfig, "string" | "boolean" | "number" | "string[]"> = {
   url: "string",
   user: "string",
+  transport: "string",
   allowWrite: "boolean",
   jobAllowlist: "string[]",
   timeoutMs: "number",
@@ -148,6 +157,13 @@ function validateProfile(name: string, p: unknown, file: string): ProfileConfig 
     if (!ok) throw new ToolError(`${file}: profile '${name}' key '${key}' must be ${expected}`);
   }
   const profile = p as ProfileConfig;
+  if (
+    profile.transport !== undefined &&
+    profile.transport !== "token" &&
+    profile.transport !== "bridge"
+  ) {
+    throw new ToolError(`${file}: profile '${name}' key 'transport' must be "token" or "bridge"`);
+  }
   for (const key of ["timeoutMs", "maxResultChars", "maxTestCases", "triggerWaitMs"] as const) {
     const v = profile[key];
     if (v !== undefined && (!Number.isFinite(v) || v < 0)) {
@@ -199,17 +215,22 @@ export function selectProfileName(
 
 /**
  * Builds the effective profile. `JENKINS_URL` / `JENKINS_USER` override the file, which lets CI
- * and containers run without any config file at all.
+ * and containers run without any config file at all. `bridge` forces the bridge transport (the
+ * `serve --bridge` flag) whatever the profile says.
  */
 export function resolveProfile(
   flag: string | undefined,
   env: Env,
   config: ConfigFile,
+  opts: { bridge?: boolean } = {},
 ): ResolvedProfile {
   const { name } = selectProfileName(flag, env, config);
   const fromFile = config.profiles[name];
+  const transport: Transport = opts.bridge ? "bridge" : (fromFile?.transport ?? "token");
   const url = env.JENKINS_URL || fromFile?.url;
-  const user = env.JENKINS_USER || fromFile?.user;
+  // The bridge signs in through the browser, so it needs no user, only the URL.
+  const user =
+    env.JENKINS_USER || fromFile?.user || (transport === "bridge" ? "browser-session" : undefined);
   if (!fromFile && !env.JENKINS_URL) {
     const known = Object.keys(config.profiles);
     throw new ToolError(
@@ -226,9 +247,12 @@ export function resolveProfile(
     name,
     url: normalizeUrl(url),
     user,
+    transport,
     allowWrite: fromFile?.allowWrite ?? false,
     jobAllowlist: fromFile?.jobAllowlist?.length ? fromFile.jobAllowlist : null,
-    timeoutMs: fromFile?.timeoutMs ?? DEFAULTS.timeoutMs,
+    timeoutMs:
+      fromFile?.timeoutMs ??
+      (transport === "bridge" ? DEFAULTS.bridgeTimeoutMs : DEFAULTS.timeoutMs),
     maxResultChars: fromFile?.maxResultChars ?? DEFAULTS.maxResultChars,
     maxTestCases: fromFile?.maxTestCases ?? DEFAULTS.maxTestCases,
     triggerWaitMs: fromFile?.triggerWaitMs ?? DEFAULTS.triggerWaitMs,

@@ -5,6 +5,7 @@ import {
   ListToolsRequestSchema,
   type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
+import { BridgeHost } from "./bridge.js";
 import {
   failureWithoutSession,
   runTool,
@@ -53,11 +54,30 @@ export function buildServer(getSession: () => Promise<Session>): Server {
   return server;
 }
 
-/** Starts stdio serving. The session is created on the first call, so a missing login still lets the client list tools. */
-export async function serve(opts: SessionOptions): Promise<void> {
+export interface ServeOptions extends SessionOptions {
+  bridgePort?: number;
+  /** Opens the bridge's pairing link; defaults to the system browser. */
+  openUrl?: (url: string) => void;
+}
+
+/**
+ * Starts stdio serving. The session is created on the first call, so a missing login still lets
+ * the client list tools, and a bridge profile starts its bridge only then.
+ */
+export async function serve(opts: ServeOptions): Promise<void> {
+  const sessionOpts: SessionOptions = {
+    ...opts,
+    bridgeHost: new BridgeHost({
+      env: opts.env ?? process.env,
+      store: opts.store,
+      port: opts.bridgePort,
+      warn: opts.warn,
+      openUrl: opts.openUrl,
+    }),
+  };
   let pending: Promise<Session> | null = null;
   const getSession = () => {
-    pending ??= createSession(opts).catch((err: unknown) => {
+    pending ??= createSession(sessionOpts).catch((err: unknown) => {
       pending = null;
       throw err;
     });

@@ -1,5 +1,5 @@
 import type { AuthProvider } from "./auth.js";
-import { JenkinsHttpError, JenkinsTimeoutError, ToolError } from "./errors.js";
+import { BrowserGatewayError, JenkinsHttpError, JenkinsTimeoutError, ToolError } from "./errors.js";
 
 export type FetchFn = typeof fetch;
 export type Query = Record<string, string | number | boolean | undefined | null>;
@@ -27,6 +27,8 @@ export interface ClientOptions {
   allowInsecureHttp?: boolean;
   /** Called after every HTTP exchange, with the path only (no query, no headers). */
   onRequest?: (record: RequestRecord) => void;
+  /** Explain a browser-only gateway instead of a confusing error; off for the bridge, which is the fix. */
+  detectGateway?: boolean;
 }
 
 export interface RequestRecord {
@@ -47,6 +49,17 @@ interface Crumb {
 }
 
 const MAX_ERROR_BODY = 300;
+
+/** IAP marks its own answers; other gateways bounce the request to a sign-in page on another host. */
+function isBrowserGateway(res: Response, baseUrl: string): boolean {
+  if (res.headers.get("x-goog-iap-generated-response") === "true") return true;
+  if (!res.redirected || !res.url) return false;
+  try {
+    return new URL(res.url).origin !== new URL(baseUrl).origin;
+  } catch {
+    return false;
+  }
+}
 
 /** Thin REST client: auth, timeouts, CSRF crumbs and error mapping. Never logs headers. */
 export class JenkinsClient {
@@ -126,6 +139,10 @@ export class JenkinsClient {
       return res;
     };
     const res = await send(false);
+    if (this.opts.detectGateway !== false && isBrowserGateway(res, this.baseUrl)) {
+      await res.body?.cancel();
+      throw new BrowserGatewayError(this.baseUrl);
+    }
     const ok = res.ok || (res.status >= 300 && res.status < 400 && options.redirect === "manual");
     if (!ok && !options.acceptStatus?.includes(res.status)) {
       const text = await res.text().catch(() => "");

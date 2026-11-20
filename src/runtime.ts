@@ -1,4 +1,5 @@
 import { BasicAuth, type AuthProvider } from "./auth.js";
+import { BridgeAuth, withJenkinsLogin, type BridgeHost } from "./bridge.js";
 import { loadConfig, resolveProfile, type Env, type ResolvedProfile } from "./config.js";
 import { resolveToken, type CredentialStore } from "./credentials.js";
 import { describeError, ToolError } from "./errors.js";
@@ -46,12 +47,26 @@ export interface SessionOptions {
   fetch?: FetchFn;
   warn?: (message: string) => void;
   mode?: Mode;
+  /** Forces the bridge transport whatever the profile says (`serve --bridge`). */
+  bridge?: boolean;
+  /** Carries bridge-transport profiles; started only when such a profile makes its first call. */
+  bridgeHost?: BridgeHost;
 }
 
 export async function createSession(opts: SessionOptions): Promise<Session> {
   const env = opts.env ?? process.env;
   const { config } = loadConfig(env);
-  const profile = resolveProfile(opts.profileFlag, env, config);
+  const profile = resolveProfile(opts.profileFlag, env, config, { bridge: opts.bridge });
+  if (profile.transport === "bridge") {
+    if (!opts.bridgeHost) {
+      throw new ToolError(
+        `Profile '${profile.name}' uses the bridge, which this command can't run`,
+      );
+    }
+    const host = opts.bridgeHost;
+    const fetchFn = withJenkinsLogin(host.fetch, host.visit, profile.url);
+    return sessionFor(profile, new BridgeAuth(), fetchFn, opts.warn, opts.mode ?? "mcp");
+  }
   const token = await resolveToken(profile.name, env, opts.store);
   return sessionFor(
     profile,
@@ -91,6 +106,7 @@ export function sessionFor(
     onRequest: (r) => {
       if (mode === "cli") requests.push(r);
     },
+    detectGateway: !(auth instanceof BridgeAuth),
   });
   return { profile, client, redactor, mode, requests };
 }

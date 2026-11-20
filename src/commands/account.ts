@@ -5,6 +5,7 @@ import {
   resolveProfile,
   saveConfig,
   selectProfileName,
+  type ConfigFile,
   type Env,
   type ProfileConfig,
   type ResolvedProfile,
@@ -32,6 +33,7 @@ export async function login(flags: Map<string, string | true>, io: CommandIO): P
   const { path, config } = loadConfig(io.env);
   const { name } = selectProfileName(flagString(flags, "profile"), io.env, config);
   const existing = config.profiles[name];
+  if (flags.get("bridge") === true) return loginBridge(name, existing, path, config, flags, io);
   io.err(`Configuring Jenkins profile '${name}' (config: ${path}).`);
   io.err(
     "Use a dedicated API token for this tool (Jenkins: your user > Security > API Token > Add new token),",
@@ -72,8 +74,11 @@ export async function login(flags: Map<string, string | true>, io: CommandIO): P
     );
     const outcome = await runTool(session, "whoAmI", {});
     if (outcome.isError) {
+      const message = (JSON.parse(outcome.text) as { message: string }).message;
       throw new ToolError(
-        `Jenkins did not accept these credentials: ${JSON.parse(outcome.text).message}`,
+        message.includes("browser sign-in gateway")
+          ? message
+          : `Jenkins did not accept these credentials: ${message}`,
       );
     }
     const fullName = (JSON.parse(outcome.text) as { result?: { fullName?: string } }).result
@@ -93,6 +98,34 @@ export async function login(flags: Map<string, string | true>, io: CommandIO): P
   io.out(
     `Saved profile '${name}'. The token is in the OS credential store (service "butlerbridge", account "${name}").`,
   );
+  return 0;
+}
+
+/** A bridge profile: only the URL. The browser session is the credential, so nothing is stored. */
+async function loginBridge(
+  name: string,
+  existing: ProfileConfig | undefined,
+  path: string,
+  config: ConfigFile,
+  flags: Map<string, string | true>,
+  io: CommandIO,
+): Promise<number> {
+  const url = normalizeUrl(flagString(flags, "url") ?? (await ask("Jenkins URL", existing?.url)));
+  if (!url.startsWith("https://")) throw new ToolError("The bridge only reaches https URLs");
+  const profileConfig: ProfileConfig = { ...existing, url, transport: "bridge" };
+  delete profileConfig.allowInsecureHttp;
+  config.profiles[name] = profileConfig;
+  saveConfig(path, config);
+  io.out(
+    `Saved bridge profile '${name}'. No API token: requests run in your signed-in Chrome through ` +
+      "the ridealong extension, which asks you to Pair and Allow the host on first use.",
+  );
+  const stale = await io.store.get(name).catch(() => null);
+  if (stale) {
+    io.out(
+      `An API token from before is still stored for '${name}'; \`butlerbridge logout --profile ${name}\` removes it.`,
+    );
+  }
   return 0;
 }
 
@@ -127,10 +160,14 @@ export async function profiles(io: CommandIO): Promise<number> {
   for (const name of names) {
     const p = config.profiles[name] as ProfileConfig;
     let token: string;
-    try {
-      token = (await io.store.get(name)) ? "stored" : "missing";
-    } catch (err) {
-      token = `unknown (${describeError(err)})`;
+    if (p.transport === "bridge") {
+      token = "none needed (bridge)";
+    } else {
+      try {
+        token = (await io.store.get(name)) ? "stored" : "missing";
+      } catch (err) {
+        token = `unknown (${describeError(err)})`;
+      }
     }
     const marks = [
       config.defaultProfile === name ? "default" : null,
@@ -139,7 +176,8 @@ export async function profiles(io: CommandIO): Promise<number> {
     ].filter(Boolean);
     io.out(`- ${name}${marks.length ? ` (${marks.join(", ")})` : ""}`);
     io.out(`    url: ${p.url}`);
-    io.out(`    user: ${p.user}`);
+    if (p.user) io.out(`    user: ${p.user}`);
+    if (p.transport === "bridge") io.out("    transport: bridge");
     io.out(`    token: ${token}`);
     if (p.jobAllowlist?.length) io.out(`    jobAllowlist: ${p.jobAllowlist.join(", ")}`);
   }

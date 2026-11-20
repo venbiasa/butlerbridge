@@ -201,3 +201,37 @@ describe("token lookup", () => {
     );
   });
 });
+
+describe("bridge transport", () => {
+  const iap: ConfigFile = {
+    profiles: { iap: { url: "https://iap.example.test", transport: "bridge" } },
+  };
+
+  it("needs no user and waits longer by default", () => {
+    expect(resolveProfile("iap", {}, iap)).toMatchObject({
+      transport: "bridge",
+      user: "browser-session",
+      timeoutMs: 90_000,
+    });
+  });
+
+  it("defaults to the token transport, which still needs a user", () => {
+    expect(resolveProfile("prod", {}, config).transport).toBe("token");
+    const noUser: ConfigFile = { profiles: { x: { url: "https://x.example.test" } } };
+    expect(() => resolveProfile("x", {}, noUser)).toThrow(/no user/);
+  });
+
+  it("is forced by serve --bridge whatever the profile says", () => {
+    expect(resolveProfile("prod", {}, config, { bridge: true }).transport).toBe("bridge");
+  });
+
+  it("accepts only token or bridge in the config file", () => {
+    expect(
+      parseConfig('{"profiles":{"a":{"url":"https://a.example.test","transport":"bridge"}}}')
+        .profiles.a?.transport,
+    ).toBe("bridge");
+    expect(() =>
+      parseConfig('{"profiles":{"a":{"url":"https://a.example.test","transport":"ssh"}}}'),
+    ).toThrow(/transport/);
+  });
+});

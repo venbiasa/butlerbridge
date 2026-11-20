@@ -1,4 +1,5 @@
 import { parseArgv, toolArgsFromFlags } from "./args.js";
+import { BridgeHost } from "./bridge.js";
 import { login, logout, profiles, type CommandIO } from "./commands/account.js";
 import { doctor } from "./commands/doctor.js";
 import {
@@ -15,9 +16,14 @@ import { VERSION } from "./version.js";
 const HELP = `butlerbridge ${VERSION} — MCP server and CLI for Jenkins (REST API)
 
 Usage:
-  butlerbridge serve [--profile <name>]          stdio MCP server
+  butlerbridge serve [--profile <name>] [--bridge] [--bridge-port <n>]
+                                                 stdio MCP server; --bridge reads Jenkins through
+                                                 the ridealong extension (IAP/SSO), as a profile
+                                                 with "transport": "bridge" does
   butlerbridge <tool> [--profile <name>] [--pretty] [--verbose] [--<param> <value> ...]
   butlerbridge login [--profile <name>] [--url <url>] [--user <user>] [--token-stdin]
+  butlerbridge login --bridge [--profile <name>] [--url <url>]
+                                                 Jenkins behind IAP/SSO: no token, via ridealong
   butlerbridge logout [--profile <name>] [--forget]
   butlerbridge profiles
   butlerbridge doctor [--profile <name>] [--redaction-sample <file>]
@@ -82,9 +88,25 @@ export async function runCli(argv: string[], io: CommandIO): Promise<number> {
     case "version":
       io.out(VERSION);
       return 0;
-    case "serve":
-      await serve({ profileFlag, env: io.env, store: io.store, warn: io.err, fetch: io.fetch });
+    case "serve": {
+      const bridge = flags.get("bridge") === true;
+      const portFlag = flags.get("bridge-port");
+      const bridgePort = typeof portFlag === "string" ? Number(portFlag) : undefined;
+      if (bridgePort !== undefined && !Number.isInteger(bridgePort)) {
+        io.err("--bridge-port must be an integer");
+        return 2;
+      }
+      await serve({
+        profileFlag,
+        env: io.env,
+        store: io.store,
+        warn: io.err,
+        fetch: io.fetch,
+        bridge,
+        bridgePort,
+      });
       return -1;
+    }
     case "login":
       return login(flags, io);
     case "logout":
@@ -106,6 +128,7 @@ export async function runCli(argv: string[], io: CommandIO): Promise<number> {
   const pretty = flags.get("pretty") === true;
   const verbose = flags.get("verbose") === true;
   let outcome: ToolOutcome;
+  const bridgeHost = new BridgeHost({ env: io.env, store: io.store, warn: io.err });
   try {
     const args = toolArgsFromFlags(tool, flags);
     const session = await createSession({
@@ -115,11 +138,14 @@ export async function runCli(argv: string[], io: CommandIO): Promise<number> {
       warn: io.err,
       fetch: io.fetch,
       mode: "cli",
+      bridgeHost,
     });
     outcome = await runTool(session, tool.name, args);
     printDiagnostics(session, outcome, verbose, io);
   } catch (err) {
     outcome = failureWithoutSession(err);
+  } finally {
+    await bridgeHost.close();
   }
   io.out(pretty ? JSON.stringify(JSON.parse(outcome.text), null, 2) : outcome.text);
   return outcome.isError ? 1 : 0;

@@ -6,6 +6,19 @@ export class ToolError extends Error {
   }
 }
 
+/** Jenkins sits behind a gateway that only admits a signed-in browser, so no API token can pass. */
+export class BrowserGatewayError extends ToolError {
+  constructor(baseUrl: string) {
+    super(
+      `${baseUrl} is behind a browser sign-in gateway (IAP/SSO), which turns API tokens away before ` +
+        "Jenkins sees them, so no token is needed or possible. Use the bridge instead: " +
+        `\`butlerbridge login --profile <name> --url ${baseUrl} --bridge\`, then sign in to Jenkins ` +
+        "in the Chrome that has the ridealong extension.",
+    );
+    this.name = "BrowserGatewayError";
+  }
+}
+
 /** A non-2xx answer from Jenkins. Carries no request headers, so it can't leak credentials. */
 export class JenkinsHttpError extends Error {
   constructor(

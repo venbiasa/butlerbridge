@@ -57,6 +57,7 @@ export function profile(overrides: Partial<ResolvedProfile> = {}): ResolvedProfi
     name: "test",
     url: BASE,
     user: USER,
+    transport: "token",
     allowWrite: false,
     jobAllowlist: null,
     timeoutMs: 2_000,
