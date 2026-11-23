@@ -200,7 +200,7 @@ describe("bridge visit", () => {
     const b = await make();
     const p = b.visit("https://jenkins.example.test/");
     const work = JSON.parse((await call(b.port, "GET", "/poll")).text) as Record<string, unknown>;
-    expect(Object.keys(work).sort()).toEqual(["id", "kind", "url"]);
+    expect(Object.keys(work).sort()).toEqual(["deadline", "id", "kind", "url"]);
     expect(work.kind).toBe("visit");
     await postResult(b, {
       id: work.id,
