@@ -1,3 +1,5 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { signRequest, verifyResponse } from "ridealong";
 import { afterEach, describe, expect, it } from "vitest";
 import { MemoryStore } from "../src/credentials.js";
@@ -243,9 +245,34 @@ describe("bridge host", () => {
     expect(store.tokens.size).toBe(0);
   });
 
-  it("explains a port already taken by another bridge", async () => {
-    const taken = await host().bridge();
-    await expect(host({ port: taken.port }).bridge()).rejects.toThrow(/already in use/);
+  const freePort = (): Promise<number> =>
+    new Promise((resolve) => {
+      const s = createServer().listen(0, "127.0.0.1", () => {
+        const { port } = s.address() as AddressInfo;
+        s.close(() => resolve(port));
+      });
+    });
+
+  it("shares the port with another session holding the same token", async () => {
+    const port = await freePort();
+    const env = { BUTLERBRIDGE_BRIDGE_TOKEN: TOKEN };
+    const first = await host({ env, port }).bridge();
+    const second = await host({ env, port }).bridge();
+    expect(first.leading()).toBe(true);
+    expect(second.leading()).toBe(false);
+    const p = second.fetch(JOB);
+    const work = JSON.parse((await call(port, "GET", "/poll")).text) as { id: string; url: string };
+    expect(work.url).toBe(JOB);
+    await call(port, "POST", "/result", JSON.stringify({ id: work.id, status: 200 }));
+    expect((await p).status).toBe(200);
+  });
+
+  it("explains a port held by a bridge with another token", async () => {
+    const port = await freePort();
+    await host({ env: { BUTLERBRIDGE_BRIDGE_TOKEN: TOKEN }, port }).bridge();
+    await expect(
+      host({ env: { BUTLERBRIDGE_BRIDGE_TOKEN: "another-token-0123456789" }, port }).bridge(),
+    ).rejects.toThrow(/already in use/);
   });
 
   it("offers pairing only when no extension connects in time", async () => {

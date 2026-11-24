@@ -43,6 +43,8 @@ export interface Bridge {
   visit(url: string, signal?: AbortSignal): Promise<Response>;
   /** Whether an extension holding the token has polled since the bridge started. */
   connected(): boolean;
+  /** Whether this process holds the port, or hands its calls to the session that does. */
+  leading(): boolean;
 }
 
 export interface BridgeOptions {
@@ -54,6 +56,8 @@ export interface BridgeOptions {
   /** Receives each pairing link; the caller opens it in the browser that has ridealong. */
   onPairingUrl?: (url: string) => void;
   onPaired?: () => void;
+  /** Share the port with other processes holding the same token instead of failing on it. */
+  shared?: boolean;
 }
 
 type HeadersArg = NonNullable<Parameters<FetchFn>[1]>["headers"];
@@ -103,6 +107,7 @@ export async function startBridge(opts: BridgeOptions = {}): Promise<Bridge> {
     pair: () => bridge.pair(),
     visit: async (url, signal) => toResponse(await bridge.visit({ url, signal })),
     connected: () => bridge.connected(),
+    leading: () => bridge.leading(),
   };
 }
 
@@ -195,7 +200,8 @@ export interface BridgeHostOptions {
 
 /**
  * One bridge per process, started on the first call that needs it, so launching the MCP server (or
- * a client's connection check) opens nothing. The token is kept in the OS credential store, so a
+ * a client's connection check) opens nothing. Sessions holding the same token share the port: the
+ * first holds it and the others hand their calls to it, taking over when it exits. The token is kept in the OS credential store, so a
  * paired extension stays paired across runs; `BUTLERBRIDGE_BRIDGE_TOKEN` overrides it. The pairing
  * page opens only when the extension asks for it or hasn't connected within `pairIfSilentMs`.
  */
@@ -249,6 +255,7 @@ export class BridgeHost {
     try {
       bridge = await startBridge({
         port,
+        shared: true,
         token: await this.token(),
         onPairingUrl: (url) => {
           warn(`butlerbridge bridge: pair the ridealong extension by opening ${url}`);
@@ -259,14 +266,19 @@ export class BridgeHost {
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") {
         throw new ToolError(
-          `The bridge port ${port} is already in use, most likely by another butlerbridge session or ` +
-            "`ridealong get`. Close that one, or serve with --bridge-port <n> and set the same port in " +
-            "the ridealong extension's options.",
+          `The bridge port ${port} is already in use by something that isn't a bridge with this ` +
+            "machine's butlerbridge token: an older butlerbridge, or `ridealong` with its own token. " +
+            "Close that one, or serve with --bridge-port <n> and set the same port in the ridealong " +
+            "extension's options.",
         );
       }
       throw err;
     }
-    warn(`butlerbridge bridge: listening on 127.0.0.1 port ${bridge.port}`);
+    warn(
+      bridge.leading()
+        ? `butlerbridge bridge: listening on 127.0.0.1 port ${bridge.port}`
+        : `butlerbridge bridge: sharing the bridge another session holds on port ${bridge.port}`,
+    );
     this.silenceTimer = setTimeout(() => {
       if (!bridge.connected()) bridge.pair();
     }, this.opts.pairIfSilentMs ?? PAIR_IF_SILENT_MS);

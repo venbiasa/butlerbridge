@@ -306,8 +306,10 @@ bridge profile; then a bridge listens on `127.0.0.1` port `8731` (`--bridge-port
   host: click **Allow**. Then open Jenkins in the same browser and sign in.
 - **The first call can be slow.** It may wait up to 30 s for the extension to notice a new bridge,
   plus any clicks, so bridge profiles default to `timeoutMs` 90 000.
-- **One bridge per port.** A second session on the same port fails with a clear "port in use"
-  message; close the other one, or use another `--bridge-port` and set it in the extension's options.
+- **Sessions share one bridge.** The first session to need it holds the port; later ones hand their
+  calls to it, and when it exits the next call takes the port over, with no new pairing. Only
+  something else on the port (an older butlerbridge, or `ridealong` with its own token) gives a
+  "port in use" message; close it, or use another `--bridge-port` and set it in the extension's options.
 - **Jenkins' own login is renewed for you.** It lapses separately from the gateway's, and only a page
   load renews it. So before calls (at most once a minute, and after a 403) butlerbridge asks Jenkins
   `whoAmI`. If the answer is anonymous, the extension opens Jenkins in a background tab that closes
