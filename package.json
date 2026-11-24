@@ -35,7 +35,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
     "@napi-rs/keyring": "^2.1.2",
-    "ridealong": "github:venbiasa/ridealong#semver:^0.2.0"
+    "ridealong": "github:venbiasa/ridealong#semver:^0.2.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
